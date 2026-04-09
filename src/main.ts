@@ -51,6 +51,8 @@ type Fighter = {
   mineCount: number;
   shieldCount: number;
   shieldTimer: number;
+  rageCharge: number;
+  rageTimer: number;
 };
 
 type Bullet = {
@@ -221,7 +223,9 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     helperType: "none",
     mineCount: 0,
     shieldCount: 0,
-    shieldTimer: 0
+    shieldTimer: 0,
+    rageCharge: isPlayer ? 100 : 0,
+    rageTimer: 0
   };
 }
 
@@ -306,6 +310,8 @@ function respawn(fighter: Fighter) {
     fighter.mineCount = 0;
     fighter.shieldCount = 0;
     fighter.shieldTimer = 0;
+    fighter.rageCharge = 100;
+    fighter.rageTimer = 0;
     spawnEnemyWave();
   }
   fighter.hp = fighter.maxHp;
@@ -505,6 +511,16 @@ function activateShield(player: Fighter) {
   playShieldSound();
 }
 
+function activateRage(player: Fighter) {
+  if (player.rageCharge < 100 || player.rageTimer > 0) {
+    return;
+  }
+
+  player.rageCharge = 0;
+  player.rageTimer = 6;
+  playTone("sawtooth", 420, 0.2, 0.04, 820);
+}
+
 function shoot(fighter: Fighter) {
   if (fighter.reload > 0 || fighter.respawn > 0) {
     return;
@@ -512,24 +528,25 @@ function shoot(fighter: Fighter) {
 
   if (fighter.isPlayer) {
     const weapon = getActivePlayerWeapon(fighter);
+    const rageReloadFactor = fighter.rageTimer > 0 ? 0.55 : 1;
 
     if (weapon === "pistol") {
-      fighter.reload = 0.1;
+      fighter.reload = 0.1 * rageReloadFactor;
       createBullet(fighter, fighter.dir, 176, 10, 24, 3, weapon);
     } else if (weapon === "shotgun") {
-      fighter.reload = 0.42;
+      fighter.reload = 0.42 * rageReloadFactor;
       createBullet(fighter, fighter.dir - 0.2, 156, 10, 16, 3, weapon);
       createBullet(fighter, fighter.dir - 0.07, 162, 10, 16, 3, weapon);
       createBullet(fighter, fighter.dir + 0.07, 162, 10, 16, 3, weapon);
       createBullet(fighter, fighter.dir + 0.2, 156, 10, 16, 3, weapon);
     } else if (weapon === "smg") {
-      fighter.reload = 0.06;
+      fighter.reload = 0.06 * rageReloadFactor;
       createBullet(fighter, fighter.dir + (Math.random() - 0.5) * 0.12, 188, 10, 14, 2, weapon);
     } else if (weapon === "rifle") {
-      fighter.reload = 0.16;
+      fighter.reload = 0.16 * rageReloadFactor;
       createBullet(fighter, fighter.dir, 240, 10, 34, 3, weapon);
     } else {
-      fighter.reload = 0.55;
+      fighter.reload = 0.55 * rageReloadFactor;
       createBullet(fighter, fighter.dir, 132, 10, 80, 5, weapon);
     }
   } else {
@@ -1235,6 +1252,10 @@ function update(dt: number) {
     fighter.flash = Math.max(0, fighter.flash - dt);
     fighter.attackCooldown = Math.max(0, fighter.attackCooldown - dt);
     fighter.shieldTimer = Math.max(0, fighter.shieldTimer - dt);
+    fighter.rageTimer = Math.max(0, fighter.rageTimer - dt);
+    if (fighter.team === "player" && fighter.rageTimer <= 0) {
+      fighter.rageCharge = Math.min(100, fighter.rageCharge + dt * 8);
+    }
 
     if (fighter.respawn > 0) {
       fighter.respawn -= dt;
@@ -1520,6 +1541,7 @@ function drawHud() {
   ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 58);
   ctx.fillText(`MINES ${player.mineCount}`, 14, 68);
   ctx.fillText(`SHLD ${player.shieldCount}`, 14, 78);
+  ctx.fillText(`RAGE ${Math.round(player.rageCharge)}%`, 14, 88);
 
   if (player.shieldTimer > 0) {
     ctx.fillStyle = "rgba(95, 193, 255, 0.3)";
@@ -1527,6 +1549,17 @@ function drawHud() {
     ctx.fillStyle = "#dff6ff";
     ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, 116, 18);
   }
+
+  ctx.fillStyle = "rgba(255, 110, 90, 0.22)";
+  ctx.fillRect(112, 24, 70, 12);
+  ctx.fillStyle = "rgba(255, 110, 90, 0.82)";
+  ctx.fillRect(112, 24, 70 * (player.rageTimer > 0 ? player.rageTimer / 6 : player.rageCharge / 100), 12);
+  ctx.fillStyle = "#fff1da";
+  ctx.fillText(
+    player.rageTimer > 0 ? `RAGE ${player.rageTimer.toFixed(1)}s` : "SPACE RAGE",
+    116,
+    34
+  );
 
   const barY = WORLD_HEIGHT - 22;
   const startX = 14;
@@ -1734,6 +1767,13 @@ window.addEventListener("keydown", (event) => {
     if (player && !isPaused) {
       activateShield(player);
     }
+  }
+  if (event.code === "Space") {
+    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    if (player && !isPaused) {
+      activateRage(player);
+    }
+    event.preventDefault();
   }
   if (event.code === "Digit1") trySelectWeapon(0);
   if (event.code === "Digit2") trySelectWeapon(1);
