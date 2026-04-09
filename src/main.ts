@@ -130,6 +130,8 @@ const explosions: Explosion[] = [];
 const weaponOrder: WeaponType[] = ["pistol", "shotgun", "smg", "rifle", "bazooka"];
 let selectedWeapon: WeaponType = "pistol";
 let isPaused = false;
+let showRulesMenu = false;
+let rulesScroll = 0;
 const spawnPoints = [
   { x: 42, y: 38 },
   { x: 120, y: 92 },
@@ -144,6 +146,22 @@ const palette = [
   ["#ff8a5b", "#ffe0c4"],
   ["#ff5f8c", "#ffd6e4"],
   ["#96e072", "#edffd9"]
+];
+
+const rulesLines = [
+  "SURVIVE, SCORE, UPGRADE.",
+  "WASD TO MOVE, MOUSE TO AIM, CLICK TO SHOOT.",
+  "1-5 SWITCH UNLOCKED WEAPONS.",
+  "5/10/15/20 KILLS UNLOCK STRONGER GUNS.",
+  "MEDKITS HEAL.",
+  "BLUE STARS GIVE RANDOM BUFFS.",
+  "RED STARS SUMMON HELPERS. MAX 2 HELPERS.",
+  "RED HELPERS SHOOT ENEMIES.",
+  "GREEN HELPERS FIRE HEALING SHOTS AT YOU.",
+  "LIGHTNING WARNS FIRST, THEN STRIKES.",
+  "P OR ESC PAUSES AND RESUMES.",
+  "CLICK BACK TO RETURN TO THE PAUSE MENU.",
+  "USE MOUSE WHEEL TO SCROLL THESE RULES."
 ];
 
 function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: number): Fighter {
@@ -1284,18 +1302,75 @@ function drawPauseOverlay() {
   ctx.fillStyle = "rgba(10, 12, 18, 0.55)";
   ctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
 
+  if (showRulesMenu) {
+    const panelX = WORLD_WIDTH / 2 - 150;
+    const panelY = WORLD_HEIGHT / 2 - 74;
+    const panelW = 300;
+    const panelH = 148;
+    const contentTop = WORLD_HEIGHT / 2 - 38;
+    const visibleHeight = 90;
+    const lineHeight = 14;
+    const maxScroll = Math.max(0, rulesLines.length * lineHeight - visibleHeight);
+
+    ctx.fillStyle = "rgba(18, 24, 38, 0.95)";
+    ctx.fillRect(panelX, panelY, panelW, panelH);
+
+    ctx.strokeStyle = "rgba(95, 193, 255, 0.35)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+    ctx.fillStyle = "#fff1da";
+    ctx.font = "bold 15px Arial";
+    ctx.fillText("RULES", WORLD_WIDTH / 2 - 20, WORLD_HEIGHT / 2 - 55);
+    ctx.font = "9px Arial";
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(WORLD_WIDTH / 2 - 140, contentTop - 8, 268, visibleHeight);
+    ctx.clip();
+    rulesLines.forEach((line, index) => {
+      ctx.fillText(line, WORLD_WIDTH / 2 - 138, contentTop + index * lineHeight - rulesScroll);
+    });
+    ctx.restore();
+
+    if (maxScroll > 0) {
+      const trackX = WORLD_WIDTH / 2 + 132;
+      const trackY = contentTop - 8;
+      const trackH = visibleHeight;
+      const thumbH = Math.max(18, (visibleHeight / (rulesLines.length * lineHeight)) * trackH);
+      const thumbY = trackY + (rulesScroll / maxScroll) * (trackH - thumbH);
+
+      ctx.fillStyle = "rgba(255,255,255,0.12)";
+      ctx.fillRect(trackX, trackY, 6, trackH);
+      ctx.fillStyle = "rgba(95, 193, 255, 0.8)";
+      ctx.fillRect(trackX, thumbY, 6, thumbH);
+    }
+
+    ctx.fillStyle = "rgba(255, 186, 83, 0.92)";
+    ctx.fillRect(WORLD_WIDTH / 2 - 46, WORLD_HEIGHT / 2 + 52, 92, 14);
+    ctx.fillStyle = "#3e2410";
+    ctx.font = "bold 11px Arial";
+    ctx.fillText("BACK", WORLD_WIDTH / 2 - 12, WORLD_HEIGHT / 2 + 61);
+    return;
+  }
+
   ctx.fillStyle = "rgba(18, 24, 38, 0.92)";
-  ctx.fillRect(WORLD_WIDTH / 2 - 78, WORLD_HEIGHT / 2 - 26, 156, 52);
+  ctx.fillRect(WORLD_WIDTH / 2 - 78, WORLD_HEIGHT / 2 - 34, 156, 68);
 
   ctx.strokeStyle = "rgba(255, 240, 184, 0.4)";
   ctx.lineWidth = 2;
-  ctx.strokeRect(WORLD_WIDTH / 2 - 78, WORLD_HEIGHT / 2 - 26, 156, 52);
+  ctx.strokeRect(WORLD_WIDTH / 2 - 78, WORLD_HEIGHT / 2 - 34, 156, 68);
 
   ctx.fillStyle = "#fff1da";
   ctx.font = "bold 14px monospace";
-  ctx.fillText("PAUSED", WORLD_WIDTH / 2 - 27, WORLD_HEIGHT / 2 - 2);
+  ctx.fillText("PAUSED", WORLD_WIDTH / 2 - 27, WORLD_HEIGHT / 2 - 12);
   ctx.font = "bold 8px monospace";
-  ctx.fillText("PRESS P OR ESC", WORLD_WIDTH / 2 - 43, WORLD_HEIGHT / 2 + 16);
+  ctx.fillText("PRESS P OR ESC", WORLD_WIDTH / 2 - 43, WORLD_HEIGHT / 2 + 6);
+
+  ctx.fillStyle = "rgba(95, 193, 255, 0.92)";
+  ctx.fillRect(WORLD_WIDTH / 2 - 34, WORLD_HEIGHT / 2 + 14, 68, 14);
+  ctx.fillStyle = "#102234";
+  ctx.fillText("RULES", WORLD_WIDTH / 2 - 15, WORLD_HEIGHT / 2 + 23);
 }
 
 function render() {
@@ -1331,6 +1406,10 @@ function updateMousePosition(event: MouseEvent) {
   input.mouseY = (event.clientY - rect.top) * scaleY;
 }
 
+function isInsideRect(x: number, y: number, rectX: number, rectY: number, width: number, height: number) {
+  return x >= rectX && x <= rectX + width && y >= rectY && y <= rectY + height;
+}
+
 function setMovementKey(code: string, isPressed: boolean) {
   if (code === "KeyW" || code === "ArrowUp") input.up = isPressed;
   if (code === "KeyS" || code === "ArrowDown") input.down = isPressed;
@@ -1358,6 +1437,9 @@ function togglePause() {
   isPaused = !isPaused;
   if (isPaused) {
     input.shoot = false;
+  } else {
+    showRulesMenu = false;
+    rulesScroll = 0;
   }
 }
 
@@ -1392,10 +1474,40 @@ window.addEventListener("keyup", (event) => {
   }
 });
 
+canvas.addEventListener("wheel", (event) => {
+  if (!isPaused || !showRulesMenu) {
+    return;
+  }
+
+  const lineHeight = 14;
+  const visibleHeight = 90;
+  const maxScroll = Math.max(0, rulesLines.length * lineHeight - visibleHeight);
+  rulesScroll = Math.max(0, Math.min(maxScroll, rulesScroll + Math.sign(event.deltaY) * 6));
+  event.preventDefault();
+}, { passive: false });
+
 canvas.addEventListener("mousemove", updateMousePosition);
-canvas.addEventListener("mousedown", () => {
+canvas.addEventListener("mousedown", (event) => {
   ensureAudio();
   audioContext?.resume();
+
+  updateMousePosition(event);
+
+  if (isPaused) {
+    if (
+      showRulesMenu &&
+      isInsideRect(input.mouseX, input.mouseY, WORLD_WIDTH / 2 - 46, WORLD_HEIGHT / 2 + 52, 92, 14)
+    ) {
+      showRulesMenu = false;
+    } else if (
+      !showRulesMenu &&
+      isInsideRect(input.mouseX, input.mouseY, WORLD_WIDTH / 2 - 34, WORLD_HEIGHT / 2 + 14, 68, 14)
+    ) {
+      showRulesMenu = true;
+    }
+    return;
+  }
+
   input.shoot = true;
 });
 window.addEventListener("keydown", () => {
