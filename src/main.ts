@@ -48,6 +48,9 @@ type Fighter = {
   damageMultiplier: number;
   team: "player" | "enemy" | "ally";
   helperType: "none" | "red" | "green";
+  mineCount: number;
+  shieldCount: number;
+  shieldTimer: number;
 };
 
 type Bullet = {
@@ -94,6 +97,22 @@ type StarPickup = {
   color: "blue" | "red";
 };
 
+type MinePickup = {
+  x: number;
+  y: number;
+};
+
+type PlacedMine = {
+  x: number;
+  y: number;
+  radius: number;
+};
+
+type ShieldPickup = {
+  x: number;
+  y: number;
+};
+
 type Explosion = {
   x: number;
   y: number;
@@ -126,6 +145,11 @@ let medkitCooldown = 4.5;
 const medkits: Medkit[] = [];
 let starCooldown = 8;
 const stars: StarPickup[] = [];
+let minePickupCooldown = 9;
+const minePickups: MinePickup[] = [];
+const placedMines: PlacedMine[] = [];
+let shieldPickupCooldown = 18;
+const shieldPickups: ShieldPickup[] = [];
 const explosions: Explosion[] = [];
 const weaponOrder: WeaponType[] = ["pistol", "shotgun", "smg", "rifle", "bazooka"];
 let selectedWeapon: WeaponType = "pistol";
@@ -194,7 +218,10 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     critChance: isPlayer ? 0.02 : 0,
     damageMultiplier: 1,
     team: isPlayer ? "player" : "enemy",
-    helperType: "none"
+    helperType: "none",
+    mineCount: 0,
+    shieldCount: 0,
+    shieldTimer: 0
   };
 }
 
@@ -204,7 +231,13 @@ function spawnRoster() {
   const playerSpawn = getSafeSpawnPoint(7);
   fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
 
-  for (const colorIndex of [1, 2, 3, 1]) {
+  spawnEnemyWave();
+}
+
+function spawnEnemyWave() {
+  const enemyPaletteOrder = [1, 2, 3, 1];
+
+  for (const colorIndex of enemyPaletteOrder) {
     const botSpawn = getSafeSpawnPoint(7);
     fighters.push(createFighter(botSpawn.x, botSpawn.y, false, colorIndex));
   }
@@ -265,6 +298,16 @@ function respawn(fighter: Fighter) {
   fighter.y = point.y;
   fighter.vx = 0;
   fighter.vy = 0;
+  if (fighter.team === "player") {
+    fighter.maxHp = 100;
+    fighter.critChance = 0.02;
+    fighter.damageMultiplier = 1;
+    fighter.score = 0;
+    fighter.mineCount = 0;
+    fighter.shieldCount = 0;
+    fighter.shieldTimer = 0;
+    spawnEnemyWave();
+  }
   fighter.hp = fighter.maxHp;
   fighter.respawn = 0;
   fighter.attackCooldown = 0;
@@ -359,6 +402,14 @@ function playHelperSound(color: "red" | "green") {
   }
 }
 
+function playMineSound() {
+  playTone("square", 260, 0.12, 0.04, 120);
+}
+
+function playShieldSound() {
+  playTone("triangle", 320, 0.14, 0.035, 640);
+}
+
 function getPlayerWeapon(score: number): WeaponType {
   if (score >= 20) return "bazooka";
   if (score >= 15) return "rifle";
@@ -430,6 +481,30 @@ function createHelper(type: "red" | "green", player: Fighter) {
   playHelperSound(type);
 }
 
+function placeMine(player: Fighter) {
+  if (player.mineCount <= 0) {
+    return;
+  }
+
+  placedMines.push({
+    x: player.x,
+    y: player.y,
+    radius: 22
+  });
+  player.mineCount -= 1;
+  playMineSound();
+}
+
+function activateShield(player: Fighter) {
+  if (player.shieldCount <= 0 || player.shieldTimer > 0) {
+    return;
+  }
+
+  player.shieldCount -= 1;
+  player.shieldTimer = 10;
+  playShieldSound();
+}
+
 function shoot(fighter: Fighter) {
   if (fighter.reload > 0 || fighter.respawn > 0) {
     return;
@@ -455,7 +530,7 @@ function shoot(fighter: Fighter) {
       createBullet(fighter, fighter.dir, 240, 10, 34, 3, weapon);
     } else {
       fighter.reload = 0.55;
-      createBullet(fighter, fighter.dir, 132, 10, 58, 5, weapon);
+      createBullet(fighter, fighter.dir, 132, 10, 80, 5, weapon);
     }
   } else {
     fighter.reload = 0.34;
@@ -548,10 +623,14 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      enemy.hp -= 32;
+      const damage = enemy.shieldTimer > 0 ? 0 : 32;
+      enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
       playHitSound(true);
+      if (enemy.shieldTimer > 0) {
+        applyKnockback(bot, enemy.x, enemy.y, 16);
+      }
 
       if (enemy.hp <= 0) {
         enemy.respawn = 2.2;
@@ -686,6 +765,14 @@ function applyKnockback(target: Fighter, sourceX: number, sourceY: number, stren
   }
 }
 
+function despawnEnemies() {
+  for (let i = fighters.length - 1; i >= 0; i -= 1) {
+    if (fighters[i].team === "enemy") {
+      fighters.splice(i, 1);
+    }
+  }
+}
+
 function defeatFighter(target: Fighter, owner?: Fighter | null) {
   if (target.team === "ally") {
     const index = fighters.findIndex((fighter) => fighter.id === target.id);
@@ -698,6 +785,9 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
 
   target.respawn = 2.2;
   target.hp = 0;
+  if (target.team === "player") {
+    despawnEnemies();
+  }
   if (owner) {
     owner.score += 1;
   }
@@ -756,11 +846,42 @@ function explodeBazooka(bullet: Bullet) {
     const damage = Math.max(18, Math.round(bullet.damage * falloff));
     fighter.hp -= damage;
     fighter.flash = 0.18;
+    applyKnockback(fighter, bullet.x, bullet.y, 14 * falloff);
 
     if (fighter.hp <= 0) {
       defeatFighter(fighter, owner);
     }
   }
+}
+
+function detonateMine(index: number) {
+  const mine = placedMines[index];
+  addExplosion(mine.x, mine.y, mine.radius);
+  playHitSound(false);
+
+  for (const fighter of fighters) {
+    if (fighter.team !== "enemy" || fighter.respawn > 0) {
+      continue;
+    }
+
+    const distance = Math.hypot(fighter.x - mine.x, fighter.y - mine.y);
+    if (distance > mine.radius) {
+      continue;
+    }
+
+    const falloff = 1 - distance / mine.radius;
+    const damage = Math.max(48, Math.round(96 * falloff));
+    fighter.hp -= damage;
+    fighter.flash = 0.18;
+    applyKnockback(fighter, mine.x, mine.y, 20 * falloff);
+
+    if (fighter.hp <= 0) {
+      const player = fighters.find((fighter) => fighter.team === "player") ?? null;
+      defeatFighter(fighter, player);
+    }
+  }
+
+  placedMines.splice(index, 1);
 }
 
 function updateBullets(dt: number) {
@@ -855,7 +976,8 @@ function updateBullets(dt: number) {
       continue;
     }
 
-    target.hp -= bullet.damage;
+    const damage = target.shieldTimer > 0 ? 0 : bullet.damage;
+    target.hp -= damage;
     target.flash = 0.14;
     bullet.life = 0;
     playHitSound(false);
@@ -911,6 +1033,28 @@ function spawnStar() {
   });
 }
 
+function spawnMinePickup() {
+  if (minePickups.length >= 1) {
+    return;
+  }
+
+  minePickups.push({
+    x: 28 + Math.random() * (WORLD_WIDTH - 56),
+    y: 28 + Math.random() * (WORLD_HEIGHT - 56)
+  });
+}
+
+function spawnShieldPickup() {
+  if (shieldPickups.length >= 1) {
+    return;
+  }
+
+  shieldPickups.push({
+    x: 28 + Math.random() * (WORLD_WIDTH - 56),
+    y: 28 + Math.random() * (WORLD_HEIGHT - 56)
+  });
+}
+
 function updateMedkits(dt: number) {
   medkitCooldown -= dt;
   if (medkitCooldown <= 0) {
@@ -929,6 +1073,50 @@ function updateMedkits(dt: number) {
       player.hp = Math.min(player.maxHp, player.hp + 32);
       medkits.splice(i, 1);
       playPickupSound();
+    }
+  }
+}
+
+function updateMinePickups(dt: number) {
+  minePickupCooldown -= dt;
+  if (minePickupCooldown <= 0) {
+    spawnMinePickup();
+    minePickupCooldown = 12 + Math.random() * 8;
+  }
+
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  if (!player) {
+    return;
+  }
+
+  for (let i = minePickups.length - 1; i >= 0; i -= 1) {
+    const minePickup = minePickups[i];
+    if (Math.hypot(player.x - minePickup.x, player.y - minePickup.y) < player.radius + 7) {
+      player.mineCount += 1;
+      minePickups.splice(i, 1);
+      playMineSound();
+    }
+  }
+}
+
+function updateShieldPickups(dt: number) {
+  shieldPickupCooldown -= dt;
+  if (shieldPickupCooldown <= 0) {
+    spawnShieldPickup();
+    shieldPickupCooldown = 18 + Math.random() * 10;
+  }
+
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  if (!player) {
+    return;
+  }
+
+  for (let i = shieldPickups.length - 1; i >= 0; i -= 1) {
+    const shieldPickup = shieldPickups[i];
+    if (Math.hypot(player.x - shieldPickup.x, player.y - shieldPickup.y) < player.radius + 7) {
+      player.shieldCount += 1;
+      shieldPickups.splice(i, 1);
+      playShieldSound();
     }
   }
 }
@@ -965,6 +1153,22 @@ function updateStars(dt: number) {
 
       stars.splice(i, 1);
       playStarSound();
+    }
+  }
+}
+
+function updatePlacedMines() {
+  for (let i = placedMines.length - 1; i >= 0; i -= 1) {
+    const mine = placedMines[i];
+    const triggered = fighters.find(
+      (fighter) =>
+        fighter.team === "enemy" &&
+        fighter.respawn <= 0 &&
+        Math.hypot(fighter.x - mine.x, fighter.y - mine.y) < fighter.radius + 6
+    );
+
+    if (triggered) {
+      detonateMine(i);
     }
   }
 }
@@ -1008,6 +1212,7 @@ function updateLightning(dt: number) {
         if (player.hp <= 0) {
           player.hp = 0;
           player.respawn = 2.2;
+          despawnEnemies();
           playDefeatSound();
         }
       }
@@ -1029,6 +1234,7 @@ function update(dt: number) {
     fighter.reload = Math.max(0, fighter.reload - dt);
     fighter.flash = Math.max(0, fighter.flash - dt);
     fighter.attackCooldown = Math.max(0, fighter.attackCooldown - dt);
+    fighter.shieldTimer = Math.max(0, fighter.shieldTimer - dt);
 
     if (fighter.respawn > 0) {
       fighter.respawn -= dt;
@@ -1051,6 +1257,9 @@ function update(dt: number) {
   updateExplosions(dt);
   updateLightning(dt);
   updateMedkits(dt);
+  updateMinePickups(dt);
+  updateShieldPickups(dt);
+  updatePlacedMines();
   updateStars(dt);
 }
 
@@ -1084,6 +1293,14 @@ function drawFighter(fighter: Fighter) {
   const weaponReach = fighter.archetype === "melee" ? 4 : 6;
   const handX = fighter.x + Math.cos(fighter.dir) * weaponReach;
   const handY = fighter.y + Math.sin(fighter.dir) * weaponReach;
+
+  if (fighter.shieldTimer > 0) {
+    ctx.strokeStyle = "rgba(95, 193, 255, 0.85)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(fighter.x, fighter.y, fighter.radius + 4, 0, TAU);
+    ctx.stroke();
+  }
 
   ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
   ctx.beginPath();
@@ -1190,6 +1407,45 @@ function drawMedkits() {
   }
 }
 
+function drawMinePickups() {
+  for (const minePickup of minePickups) {
+    ctx.fillStyle = "#4b4b56";
+    ctx.fillRect(minePickup.x - 5, minePickup.y - 5, 10, 10);
+    ctx.fillStyle = "#e66a4f";
+    ctx.fillRect(minePickup.x - 1, minePickup.y - 1, 2, 2);
+    ctx.fillStyle = "#c7c7d1";
+    ctx.fillRect(minePickup.x - 6, minePickup.y, 12, 1);
+    ctx.fillRect(minePickup.x, minePickup.y - 6, 1, 12);
+  }
+}
+
+function drawShieldPickups() {
+  for (const shieldPickup of shieldPickups) {
+    ctx.strokeStyle = "#9ad3ff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(shieldPickup.x, shieldPickup.y, 6, 0, TAU);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#dff6ff";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(shieldPickup.x, shieldPickup.y, 3, 0, TAU);
+    ctx.stroke();
+  }
+}
+
+function drawPlacedMines() {
+  for (const mine of placedMines) {
+    ctx.fillStyle = "#3b3d45";
+    ctx.beginPath();
+    ctx.arc(mine.x, mine.y, 5, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = "#ff6856";
+    ctx.fillRect(mine.x - 1, mine.y - 1, 2, 2);
+  }
+}
+
 function drawStars() {
   for (const star of stars) {
     ctx.fillStyle = star.color === "blue" ? "#5fc1ff" : "#ff6b6b";
@@ -1262,6 +1518,15 @@ function drawHud() {
   ctx.fillText(getActivePlayerWeapon(player).toUpperCase(), 14, 38);
   ctx.fillText(`CRIT ${Math.round(player.critChance * 100)}%`, 14, 48);
   ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 58);
+  ctx.fillText(`MINES ${player.mineCount}`, 14, 68);
+  ctx.fillText(`SHLD ${player.shieldCount}`, 14, 78);
+
+  if (player.shieldTimer > 0) {
+    ctx.fillStyle = "rgba(95, 193, 255, 0.3)";
+    ctx.fillRect(112, 8, 70, 12);
+    ctx.fillStyle = "#dff6ff";
+    ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, 116, 18);
+  }
 
   const barY = WORLD_HEIGHT - 22;
   const startX = 14;
@@ -1377,6 +1642,9 @@ function render() {
   drawArena();
   drawSpawnWarnings();
   drawMedkits();
+  drawMinePickups();
+  drawShieldPickups();
+  drawPlacedMines();
   drawStars();
   drawBullets();
   drawExplosions();
@@ -1455,6 +1723,18 @@ window.addEventListener("keydown", (event) => {
   }
 
   setMovementKey(event.code, true);
+  if (event.code === "KeyE") {
+    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    if (player && !isPaused) {
+      placeMine(player);
+    }
+  }
+  if (event.code === "KeyF") {
+    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    if (player && !isPaused) {
+      activateShield(player);
+    }
+  }
   if (event.code === "Digit1") trySelectWeapon(0);
   if (event.code === "Digit2") trySelectWeapon(1);
   if (event.code === "Digit3") trySelectWeapon(2);
