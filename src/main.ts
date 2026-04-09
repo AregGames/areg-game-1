@@ -181,14 +181,8 @@ let isPaused = false;
 let showRulesMenu = false;
 let rulesScroll = 0;
 let rulesTouchY: number | null = null;
-const spawnPoints = [
-  { x: 42, y: 38 },
-  { x: 120, y: 92 },
-  { x: 438, y: 42 },
-  { x: 438, y: 228 },
-  { x: 42, y: 228 },
-  { x: 250, y: 220 }
-];
+let mobileFullscreenAttempted = false;
+let pendingRunReset = false;
 
 const palette = [
   ["#57d7ff", "#dffaff"],
@@ -256,9 +250,22 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
 function spawnRoster() {
   fighters.length = 0;
   bullets.length = 0;
+  lightningStrikes.length = 0;
+  medkits.length = 0;
+  stars.length = 0;
+  minePickups.length = 0;
+  placedMines.length = 0;
+  shieldPickups.length = 0;
+  explosions.length = 0;
+  lightningCooldown = 2.4;
+  medkitCooldown = 4.5;
+  starCooldown = 8;
+  minePickupCooldown = 9;
+  shieldPickupCooldown = 18;
   selectedWeapon = "pistol";
   highestUnlockedWeapon = "pistol";
-  const playerSpawn = getSafeSpawnPoint(7);
+  pendingRunReset = false;
+  const playerSpawn = getRandomSpawnPoint(7);
   fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
 
   spawnEnemyWave();
@@ -266,9 +273,13 @@ function spawnRoster() {
 
 function spawnEnemyWave() {
   const enemyPaletteOrder = [1, 2, 3, 1];
+  const reservedSpawns = fighters
+    .filter((fighter) => fighter.respawn <= 0)
+    .map((fighter) => ({ x: fighter.x, y: fighter.y, radius: fighter.radius }));
 
   for (const colorIndex of enemyPaletteOrder) {
-    const botSpawn = getSafeSpawnPoint(7);
+    const botSpawn = getRandomSpawnPoint(7, undefined, reservedSpawns);
+    reservedSpawns.push({ x: botSpawn.x, y: botSpawn.y, radius: 7 });
     fighters.push(createFighter(botSpawn.x, botSpawn.y, false, colorIndex));
   }
 }
@@ -306,22 +317,55 @@ function isSpawnPointFree(x: number, y: number, radius: number, ignoreId?: numbe
   });
 }
 
-function getSafeSpawnPoint(radius: number, ignoreId?: number) {
-  const validPoints = spawnPoints.filter(
-    (point) => canMoveTo(point.x, point.y, radius) && isSpawnPointFree(point.x, point.y, radius, ignoreId)
-  );
+function isReservedSpawnFree(
+  x: number,
+  y: number,
+  radius: number,
+  reservedPoints: Array<{ x: number; y: number; radius: number }>
+) {
+  return !reservedPoints.some((point) => Math.hypot(point.x - x, point.y - y) < point.radius + radius + 10);
+}
 
-  if (validPoints.length > 0) {
-    return validPoints[Math.floor(Math.random() * validPoints.length)];
+function getRandomSpawnPoint(
+  radius: number,
+  ignoreId?: number,
+  reservedPoints: Array<{ x: number; y: number; radius: number }> = []
+) {
+  const margin = 18 + radius;
+
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const x = margin + Math.random() * (WORLD_WIDTH - margin * 2);
+    const y = margin + Math.random() * (WORLD_HEIGHT - margin * 2);
+
+    if (
+      canMoveTo(x, y, radius) &&
+      isSpawnPointFree(x, y, radius, ignoreId) &&
+      isReservedSpawnFree(x, y, radius, reservedPoints)
+    ) {
+      return { x, y };
+    }
   }
 
-  const fallbackPoints = spawnPoints.filter((point) => canMoveTo(point.x, point.y, radius));
-  const pool = fallbackPoints.length > 0 ? fallbackPoints : spawnPoints;
-  return pool[Math.floor(Math.random() * pool.length)];
+  for (let y = margin; y <= WORLD_HEIGHT - margin; y += 20) {
+    for (let x = margin; x <= WORLD_WIDTH - margin; x += 20) {
+      if (
+        canMoveTo(x, y, radius) &&
+        isSpawnPointFree(x, y, radius, ignoreId) &&
+        isReservedSpawnFree(x, y, radius, reservedPoints)
+      ) {
+        return { x, y };
+      }
+    }
+  }
+
+  return {
+    x: WORLD_WIDTH / 2,
+    y: WORLD_HEIGHT / 2
+  };
 }
 
 function respawn(fighter: Fighter) {
-  const point = getSafeSpawnPoint(fighter.radius, fighter.id);
+  const point = getRandomSpawnPoint(fighter.radius, fighter.id);
   fighter.spawnX = point.x;
   fighter.spawnY = point.y;
   fighter.x = point.x;
@@ -688,7 +732,7 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      const damage = enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 32;
+      const damage = enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 16;
       enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
@@ -700,10 +744,7 @@ function updateBot(bot: Fighter, dt: number) {
       }
 
       if (enemy.hp <= 0) {
-        enemy.respawn = 2.2;
-        enemy.hp = 0;
-        bot.score += 1;
-        playDefeatSound();
+        defeatFighter(enemy, bot);
       }
     }
   } else if (dist < 118 && !lineBlocked(bot.x, bot.y, enemy.x, enemy.y)) {
@@ -833,8 +874,36 @@ function applyKnockback(target: Fighter, sourceX: number, sourceY: number, stren
 }
 
 function despawnEnemies() {
+  const enemyIds = new Set(
+    fighters.filter((fighter) => fighter.team === "enemy").map((fighter) => fighter.id)
+  );
+
   for (let i = fighters.length - 1; i >= 0; i -= 1) {
     if (fighters[i].team === "enemy") {
+      fighters.splice(i, 1);
+    }
+  }
+
+  for (let i = bullets.length - 1; i >= 0; i -= 1) {
+    if (enemyIds.has(bullets[i].ownerId)) {
+      bullets.splice(i, 1);
+    }
+  }
+}
+
+function clearRunStateOnPlayerDeath() {
+  despawnEnemies();
+  bullets.length = 0;
+  lightningStrikes.length = 0;
+  medkits.length = 0;
+  stars.length = 0;
+  minePickups.length = 0;
+  placedMines.length = 0;
+  shieldPickups.length = 0;
+  explosions.length = 0;
+
+  for (let i = fighters.length - 1; i >= 0; i -= 1) {
+    if (fighters[i].team === "ally") {
       fighters.splice(i, 1);
     }
   }
@@ -853,7 +922,8 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
   target.respawn = 2.2;
   target.hp = 0;
   if (target.team === "player") {
-    despawnEnemies();
+    clearRunStateOnPlayerDeath();
+    pendingRunReset = true;
   }
   if (owner) {
     owner.score += 1;
@@ -1297,7 +1367,8 @@ function updateLightning(dt: number) {
         if (player.hp <= 0) {
           player.hp = 0;
           player.respawn = 2.2;
-          despawnEnemies();
+          clearRunStateOnPlayerDeath();
+          pendingRunReset = true;
           playDefeatSound();
         }
       }
@@ -1314,6 +1385,7 @@ function updateLightning(dt: number) {
 
 function update(dt: number) {
   elapsed += dt;
+  let shouldResetRoster = false;
 
   for (const fighter of fighters) {
     fighter.reload = Math.max(0, fighter.reload - dt);
@@ -1329,7 +1401,11 @@ function update(dt: number) {
     if (fighter.respawn > 0) {
       fighter.respawn -= dt;
       if (fighter.respawn <= 0) {
-        respawn(fighter);
+        if (fighter.team === "player" && pendingRunReset) {
+          shouldResetRoster = true;
+        } else {
+          respawn(fighter);
+        }
       }
       continue;
     }
@@ -1351,6 +1427,10 @@ function update(dt: number) {
   updateShieldPickups(dt);
   updatePlacedMines();
   updateStars(dt);
+
+  if (shouldResetRoster) {
+    spawnRoster();
+  }
 }
 
 function drawArena() {
@@ -1619,10 +1699,45 @@ function getMobileWeaponButtonRect(index: number) {
 function getMobileRageButtonRect() {
   return {
     x: WORLD_WIDTH - 70,
-    y: 8,
+    y: 30,
     width: 58,
     height: 18
   };
+}
+
+async function toggleFullscreen() {
+  const fullscreenTarget = canvas as HTMLCanvasElement & {
+    webkitRequestFullscreen?: () => Promise<void> | void;
+  };
+  const fullscreenDocument = document as Document & {
+    webkitExitFullscreen?: () => Promise<void> | void;
+  };
+
+  if (document.fullscreenElement) {
+    if (document.exitFullscreen) {
+      await document.exitFullscreen();
+    } else {
+      await fullscreenDocument.webkitExitFullscreen?.();
+    }
+    return;
+  }
+
+  if (canvas.requestFullscreen) {
+    await canvas.requestFullscreen();
+  } else {
+    await fullscreenTarget.webkitRequestFullscreen?.();
+  }
+}
+
+function tryEnterMobileFullscreen() {
+  if (!touchControls.enabled || mobileFullscreenAttempted || document.fullscreenElement) {
+    return;
+  }
+
+  mobileFullscreenAttempted = true;
+  void toggleFullscreen().catch(() => {
+    mobileFullscreenAttempted = false;
+  });
 }
 
 function drawHud() {
@@ -2116,9 +2231,12 @@ canvas.addEventListener("touchstart", (event) => {
   audioContext?.resume();
   touchControls.enabled = true;
 
+  let consumedAnyTouch = false;
+
   for (const touch of event.changedTouches) {
     const point = getCanvasPoint(touch.clientX, touch.clientY);
     const consumed = handleTouchPress(touch.clientX, touch.clientY);
+    consumedAnyTouch = consumedAnyTouch || consumed;
 
     if (isPaused || consumed) {
       continue;
@@ -2140,6 +2258,10 @@ canvas.addEventListener("touchstart", (event) => {
       touchControls.aimStickY = point.y;
       updateTouchAim(touch.clientX, touch.clientY);
     }
+  }
+
+  if (!consumedAnyTouch) {
+    tryEnterMobileFullscreen();
   }
 
   event.preventDefault();
