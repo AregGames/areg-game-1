@@ -44,6 +44,10 @@ type Fighter = {
   attackCooldown: number;
   spawnX: number;
   spawnY: number;
+  critChance: number;
+  damageMultiplier: number;
+  team: "player" | "enemy" | "ally";
+  helperType: "none" | "red" | "green";
 };
 
 type Bullet = {
@@ -57,6 +61,8 @@ type Bullet = {
   damage: number;
   size: number;
   weapon: WeaponType;
+  isCrit: boolean;
+  healAmount: number;
 };
 
 type Wall = {
@@ -80,6 +86,12 @@ type LightningStrike = {
 type Medkit = {
   x: number;
   y: number;
+};
+
+type StarPickup = {
+  x: number;
+  y: number;
+  color: "blue" | "red";
 };
 
 type Explosion = {
@@ -112,9 +124,12 @@ let lightningCooldown = 2.4;
 const lightningStrikes: LightningStrike[] = [];
 let medkitCooldown = 4.5;
 const medkits: Medkit[] = [];
+let starCooldown = 8;
+const stars: StarPickup[] = [];
 const explosions: Explosion[] = [];
 const weaponOrder: WeaponType[] = ["pistol", "shotgun", "smg", "rifle", "bazooka"];
 let selectedWeapon: WeaponType = "pistol";
+let isPaused = false;
 const spawnPoints = [
   { x: 42, y: 38 },
   { x: 120, y: 92 },
@@ -157,18 +172,24 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     archetype: isPlayer ? "ranged" : Math.random() < 0.8 ? "melee" : "ranged",
     attackCooldown: 0,
     spawnX: x,
-    spawnY: y
+    spawnY: y,
+    critChance: isPlayer ? 0.02 : 0,
+    damageMultiplier: 1,
+    team: isPlayer ? "player" : "enemy",
+    helperType: "none"
   };
 }
 
 function spawnRoster() {
   fighters.length = 0;
   bullets.length = 0;
-  fighters.push(createFighter(spawnPoints[0].x, spawnPoints[0].y, true, 0));
-  fighters.push(createFighter(spawnPoints[1].x, spawnPoints[1].y, false, 1));
-  fighters.push(createFighter(spawnPoints[2].x, spawnPoints[2].y, false, 2));
-  fighters.push(createFighter(spawnPoints[3].x, spawnPoints[3].y, false, 3));
-  fighters.push(createFighter(spawnPoints[4].x, spawnPoints[4].y, false, 1));
+  const playerSpawn = getSafeSpawnPoint(7);
+  fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
+
+  for (const colorIndex of [1, 2, 3, 1]) {
+    const botSpawn = getSafeSpawnPoint(7);
+    fighters.push(createFighter(botSpawn.x, botSpawn.y, false, colorIndex));
+  }
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -195,10 +216,31 @@ function canMoveTo(x: number, y: number, radius: number) {
   );
 }
 
+function isSpawnPointFree(x: number, y: number, radius: number, ignoreId?: number) {
+  return !fighters.some((fighter) => {
+    if (fighter.id === ignoreId || fighter.respawn > 0) {
+      return false;
+    }
+    return Math.hypot(fighter.x - x, fighter.y - y) < fighter.radius + radius + 10;
+  });
+}
+
+function getSafeSpawnPoint(radius: number, ignoreId?: number) {
+  const validPoints = spawnPoints.filter(
+    (point) => canMoveTo(point.x, point.y, radius) && isSpawnPointFree(point.x, point.y, radius, ignoreId)
+  );
+
+  if (validPoints.length > 0) {
+    return validPoints[Math.floor(Math.random() * validPoints.length)];
+  }
+
+  const fallbackPoints = spawnPoints.filter((point) => canMoveTo(point.x, point.y, radius));
+  const pool = fallbackPoints.length > 0 ? fallbackPoints : spawnPoints;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 function respawn(fighter: Fighter) {
-  const safePoints = spawnPoints.filter((point) => canMoveTo(point.x, point.y, fighter.radius));
-  const pool = safePoints.length > 0 ? safePoints : spawnPoints;
-  const point = pool[Math.floor(Math.random() * pool.length)];
+  const point = getSafeSpawnPoint(fighter.radius, fighter.id);
   fighter.spawnX = point.x;
   fighter.spawnY = point.y;
   fighter.x = point.x;
@@ -286,6 +328,19 @@ function playPickupSound() {
   playTone("triangle", 480, 0.08, 0.03, 740);
 }
 
+function playStarSound() {
+  playTone("sine", 620, 0.1, 0.03, 880);
+  playTone("triangle", 880, 0.12, 0.025, 1180);
+}
+
+function playHelperSound(color: "red" | "green") {
+  if (color === "red") {
+    playTone("square", 520, 0.11, 0.03, 280);
+  } else {
+    playTone("sine", 540, 0.12, 0.03, 760);
+  }
+}
+
 function getPlayerWeapon(score: number): WeaponType {
   if (score >= 20) return "bazooka";
   if (score >= 15) return "rifle";
@@ -303,6 +358,7 @@ function createBullet(
   size: number,
   weapon: WeaponType
 ) {
+  const isCrit = fighter.isPlayer && Math.random() < fighter.critChance;
   bullets.push({
     x: fighter.x + Math.cos(direction) * 8,
     y: fighter.y + Math.sin(direction) * 8,
@@ -311,9 +367,11 @@ function createBullet(
     ownerId: fighter.id,
     life,
     color: fighter.accent,
-    damage,
+    damage: (isCrit ? damage * 2 : damage) * fighter.damageMultiplier,
     size,
-    weapon
+    weapon,
+    isCrit,
+    healAmount: 0
   });
 }
 
@@ -333,6 +391,25 @@ function getActivePlayerWeapon(player: Fighter) {
     selectedWeapon = unlocked[unlocked.length - 1];
   }
   return selectedWeapon;
+}
+
+function createHelper(type: "red" | "green", player: Fighter) {
+  const activeHelpers = fighters.filter((fighter) => fighter.team === "ally" && fighter.respawn <= 0);
+  if (activeHelpers.length >= 2) {
+    return;
+  }
+
+  const helper = createFighter(player.x + 12, player.y + 12, false, type === "red" ? 2 : 3);
+  helper.team = "ally";
+  helper.helperType = type;
+  helper.archetype = "ranged";
+  helper.hp = 1000;
+  helper.maxHp = 1000;
+  helper.speed = type === "red" ? 56 : 60;
+  helper.damageMultiplier = 1;
+  helper.critChance = 0;
+  fighters.push(helper);
+  playHelperSound(type);
 }
 
 function shoot(fighter: Fighter) {
@@ -371,17 +448,35 @@ function shoot(fighter: Fighter) {
 }
 
 function chooseBotTarget(bot: Fighter) {
-  const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
+  const targets = fighters.filter(
+    (fighter) => (fighter.team === "player" || fighter.team === "ally") && fighter.respawn <= 0
+  );
 
-  if (!player) {
+  if (targets.length === 0) {
     return null;
   }
 
-  return {
-    fighter: player,
-    distance: Math.hypot(player.x - bot.x, player.y - bot.y) || 1,
-    score: 0
-  };
+  return targets
+    .map((fighter) => ({
+      fighter,
+      distance: Math.hypot(fighter.x - bot.x, fighter.y - bot.y) || 1,
+      score: 0
+    }))
+    .sort((a, b) => a.distance - b.distance)[0];
+}
+
+function chooseHelperTarget(helper: Fighter) {
+  const enemies = fighters.filter((fighter) => fighter.team === "enemy" && fighter.respawn <= 0);
+  if (enemies.length === 0) {
+    return null;
+  }
+
+  return enemies
+    .map((fighter) => ({
+      fighter,
+      distance: Math.hypot(fighter.x - helper.x, fighter.y - helper.y) || 1
+    }))
+    .sort((a, b) => a.distance - b.distance)[0];
 }
 
 function updatePlayer(player: Fighter, dt: number) {
@@ -454,6 +549,96 @@ function updateBot(bot: Fighter, dt: number) {
   moveFighter(bot, dt);
 }
 
+function updateHelper(helper: Fighter, dt: number) {
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  if (!player) {
+    return;
+  }
+
+  if (helper.helperType === "green") {
+    helper.dir = Math.atan2(player.y - helper.y, player.x - helper.x);
+    helper.targetX = player.x - Math.cos(elapsed * 2 + helper.id) * 18;
+    helper.targetY = player.y - Math.sin(elapsed * 2 + helper.id) * 18;
+
+    const moveDX = helper.targetX - helper.x;
+    const moveDY = helper.targetY - helper.y;
+    const moveLen = Math.hypot(moveDX, moveDY) || 1;
+    helper.vx = (moveDX / moveLen) * helper.speed;
+    helper.vy = (moveDY / moveLen) * helper.speed;
+
+    if (helper.reload <= 0 && Math.hypot(player.x - helper.x, player.y - helper.y) < 80) {
+      helper.reload = 0.8;
+      player.hp = Math.min(player.maxHp, player.hp + 10);
+      player.flash = 0.08;
+      bullets.push({
+        x: helper.x,
+        y: helper.y,
+        vx: Math.cos(helper.dir) * 120,
+        vy: Math.sin(helper.dir) * 120,
+        ownerId: helper.id,
+        life: 1,
+        color: "#7dff9d",
+        damage: 0,
+        size: 3,
+        weapon: "pistol",
+        isCrit: false,
+        healAmount: 5
+      });
+      playShootSound(false);
+    }
+
+    moveFighter(helper, dt);
+    return;
+  }
+
+  const target = chooseHelperTarget(helper);
+  if (!target) {
+    return;
+  }
+
+  const enemy = target.fighter;
+  const dx = enemy.x - helper.x;
+  const dy = enemy.y - helper.y;
+  const dist = target.distance;
+  helper.dir = Math.atan2(dy, dx);
+
+  if (helper.wander <= 0) {
+    helper.wander = 0.7 + Math.random() * 1.1;
+    const orbit = dist < 80 ? -1 : 1;
+    helper.targetX = enemy.x - (dx / dist) * 62 + (-dy / dist) * 16 * orbit;
+    helper.targetY = enemy.y - (dy / dist) * 62 + (dx / dist) * 16 * orbit;
+  } else {
+    helper.wander -= dt;
+  }
+
+  const moveDX = helper.targetX - helper.x;
+  const moveDY = helper.targetY - helper.y;
+  const moveLen = Math.hypot(moveDX, moveDY) || 1;
+  helper.vx = (moveDX / moveLen) * helper.speed;
+  helper.vy = (moveDY / moveLen) * helper.speed;
+
+  if (dist < 140 && helper.reload <= 0) {
+    helper.reload = 0.55;
+    bullets.push({
+      x: helper.x + Math.cos(helper.dir) * 8,
+      y: helper.y + Math.sin(helper.dir) * 8,
+      vx: Math.cos(helper.dir) * 118,
+      vy: Math.sin(helper.dir) * 118,
+      ownerId: helper.id,
+      life: 1.3,
+      color: "#ff7a7a",
+      damage: 18,
+      size: 3,
+      weapon: "pistol",
+      isCrit: false,
+      healAmount: 0
+    });
+    playShootSound(false);
+  }
+
+  moveFighter(helper, dt);
+}
+
 function moveFighter(fighter: Fighter, dt: number) {
   const nextX = fighter.x + fighter.vx * dt;
   const nextY = fighter.y + fighter.vy * dt;
@@ -466,7 +651,33 @@ function moveFighter(fighter: Fighter, dt: number) {
   }
 }
 
+function applyKnockback(target: Fighter, sourceX: number, sourceY: number, strength: number) {
+  const dx = target.x - sourceX;
+  const dy = target.y - sourceY;
+  const length = Math.hypot(dx, dy) || 1;
+  const knockX = (dx / length) * strength;
+  const knockY = (dy / length) * strength;
+  const nextX = target.x + knockX;
+  const nextY = target.y + knockY;
+
+  if (canMoveTo(nextX, target.y, target.radius)) {
+    target.x = nextX;
+  }
+  if (canMoveTo(target.x, nextY, target.radius)) {
+    target.y = nextY;
+  }
+}
+
 function defeatFighter(target: Fighter, owner?: Fighter | null) {
+  if (target.team === "ally") {
+    const index = fighters.findIndex((fighter) => fighter.id === target.id);
+    if (index >= 0) {
+      fighters.splice(index, 1);
+    }
+    playDefeatSound();
+    return;
+  }
+
   target.respawn = 2.2;
   target.hp = 0;
   if (owner) {
@@ -485,6 +696,26 @@ function addExplosion(x: number, y: number, radius: number) {
   });
 }
 
+function canHitTarget(owner: Fighter | null, target: Fighter) {
+  if (!owner) {
+    return false;
+  }
+
+  if (owner.team === "player") {
+    return target.team === "enemy";
+  }
+
+  if (owner.team === "enemy") {
+    return target.team === "player" || target.team === "ally";
+  }
+
+  if (owner.helperType === "green") {
+    return false;
+  }
+
+  return target.team === "enemy";
+}
+
 function explodeBazooka(bullet: Bullet) {
   const owner = fighters.find((fighter) => fighter.id === bullet.ownerId) ?? null;
   addExplosion(bullet.x, bullet.y, 30);
@@ -494,7 +725,7 @@ function explodeBazooka(bullet: Bullet) {
     if (fighter.respawn > 0 || fighter.id === bullet.ownerId) {
       continue;
     }
-    if (owner && owner.isPlayer === fighter.isPlayer) {
+    if (!canHitTarget(owner, fighter)) {
       continue;
     }
 
@@ -520,17 +751,44 @@ function updateBullets(dt: number) {
     bullet.y += bullet.vy * dt;
     bullet.life -= dt;
 
-    if (bullet.weapon === "bazooka") {
-      const splashTarget = fighters.find((fighter) => {
-        if (fighter.id === bullet.ownerId || fighter.respawn > 0) {
-          return false;
-        }
+    if (bullet.healAmount > 0) {
+      const healerTarget = fighters.find((fighter) => {
         const owner = fighters.find((candidate) => candidate.id === bullet.ownerId);
-        if (!owner || owner.isPlayer === fighter.isPlayer) {
+        if (!owner) {
           return false;
         }
-        return Math.hypot(fighter.x - bullet.x, fighter.y - bullet.y) < 22;
+        return (
+          fighter.team === "player" &&
+          fighter.respawn <= 0 &&
+          Math.hypot(fighter.x - bullet.x, fighter.y - bullet.y) < fighter.radius + bullet.size + 1
+        );
       });
+
+      if (healerTarget) {
+        healerTarget.hp = Math.min(healerTarget.maxHp, healerTarget.hp + bullet.healAmount);
+        healerTarget.flash = 0.08;
+        bullet.life = 0;
+        playPickupSound();
+        continue;
+      }
+    }
+
+    if (bullet.weapon === "bazooka") {
+      const splashTarget = fighters
+        .filter((fighter) => {
+          if (fighter.id === bullet.ownerId || fighter.respawn > 0) {
+            return false;
+          }
+          const owner = fighters.find((candidate) => candidate.id === bullet.ownerId);
+          if (!canHitTarget(owner ?? null, fighter)) {
+            return false;
+          }
+          return Math.hypot(fighter.x - bullet.x, fighter.y - bullet.y) < 22;
+        })
+        .sort(
+          (a, b) =>
+            Math.hypot(a.x - bullet.x, a.y - bullet.y) - Math.hypot(b.x - bullet.x, b.y - bullet.y)
+        )[0];
 
       if (splashTarget) {
         explodeBazooka(bullet);
@@ -553,19 +811,21 @@ function updateBullets(dt: number) {
       continue;
     }
 
-    const target = fighters.find((fighter) => {
-      if (fighter.id === bullet.ownerId || fighter.respawn > 0) {
-        return false;
-      }
-      const owner = fighters.find((candidate) => candidate.id === bullet.ownerId);
-      if (!owner) {
-        return false;
-      }
-      if (owner.isPlayer === fighter.isPlayer) {
-        return false;
-      }
-      return Math.hypot(fighter.x - bullet.x, fighter.y - bullet.y) < fighter.radius + bullet.size;
-    });
+    const target = fighters
+      .filter((fighter) => {
+        if (fighter.id === bullet.ownerId || fighter.respawn > 0) {
+          return false;
+        }
+        const owner = fighters.find((candidate) => candidate.id === bullet.ownerId);
+        if (!canHitTarget(owner ?? null, fighter)) {
+          return false;
+        }
+        return Math.hypot(fighter.x - bullet.x, fighter.y - bullet.y) < fighter.radius + bullet.size;
+      })
+      .sort(
+        (a, b) =>
+          Math.hypot(a.x - bullet.x, a.y - bullet.y) - Math.hypot(b.x - bullet.x, b.y - bullet.y)
+      )[0];
 
     if (!target) {
       continue;
@@ -581,6 +841,9 @@ function updateBullets(dt: number) {
     target.flash = 0.14;
     bullet.life = 0;
     playHitSound(false);
+    if (bullet.isCrit) {
+      applyKnockback(target, bullet.x, bullet.y, 8);
+    }
 
     const owner = fighters.find((fighter) => fighter.id === bullet.ownerId);
     if (target.hp <= 0) {
@@ -608,13 +871,25 @@ function updateExplosions(dt: number) {
 }
 
 function spawnMedkit() {
-  if (medkits.length >= 3) {
+  if (medkits.length >= 1) {
     return;
   }
 
   medkits.push({
     x: 24 + Math.random() * (WORLD_WIDTH - 48),
     y: 24 + Math.random() * (WORLD_HEIGHT - 48)
+  });
+}
+
+function spawnStar() {
+  if (stars.length >= 1) {
+    return;
+  }
+
+  stars.push({
+    x: 28 + Math.random() * (WORLD_WIDTH - 56),
+    y: 28 + Math.random() * (WORLD_HEIGHT - 56),
+    color: Math.random() < 0.5 ? "blue" : "red"
   });
 }
 
@@ -636,6 +911,42 @@ function updateMedkits(dt: number) {
       player.hp = Math.min(player.maxHp, player.hp + 32);
       medkits.splice(i, 1);
       playPickupSound();
+    }
+  }
+}
+
+function updateStars(dt: number) {
+  starCooldown -= dt;
+  if (starCooldown <= 0) {
+    spawnStar();
+    starCooldown = 10 + Math.random() * 6;
+  }
+
+  const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
+  if (!player) {
+    return;
+  }
+
+  for (let i = stars.length - 1; i >= 0; i -= 1) {
+    const star = stars[i];
+    if (Math.hypot(player.x - star.x, player.y - star.y) < player.radius + 8) {
+      if (star.color === "blue") {
+        const roll = Math.random();
+        if (roll < 0.25) {
+          player.critChance += 0.01;
+        } else if (roll < 0.5) {
+          player.damageMultiplier *= 1.2;
+        } else if (roll < 0.75) {
+          const previousMaxHp = player.maxHp;
+          player.maxHp = Math.round(player.maxHp * 1.2);
+          player.hp = Math.min(player.maxHp, player.hp + (player.maxHp - previousMaxHp));
+        }
+      } else {
+        createHelper(Math.random() < 0.5 ? "red" : "green", player);
+      }
+
+      stars.splice(i, 1);
+      playStarSound();
     }
   }
 }
@@ -709,8 +1020,10 @@ function update(dt: number) {
       continue;
     }
 
-    if (fighter.isPlayer) {
+    if (fighter.team === "player") {
       updatePlayer(fighter, dt);
+    } else if (fighter.team === "ally") {
+      updateHelper(fighter, dt);
     } else {
       updateBot(fighter, dt);
     }
@@ -720,6 +1033,7 @@ function update(dt: number) {
   updateExplosions(dt);
   updateLightning(dt);
   updateMedkits(dt);
+  updateStars(dt);
 }
 
 function drawArena() {
@@ -731,14 +1045,6 @@ function drawArena() {
       ctx.fillStyle = (x + y) % 32 === 0 ? "#2d4d53" : "#345b5f";
       ctx.fillRect(x, y, 16, 16);
     }
-  }
-
-  ctx.fillStyle = "#4f774d";
-  for (let i = 0; i < 34; i += 1) {
-    const x = (i * 43) % WORLD_WIDTH;
-    const y = (i * 29) % WORLD_HEIGHT;
-    ctx.fillRect(x, y, 5, 5);
-    ctx.fillRect(x + 2, y + 3, 6, 4);
   }
 
   for (const wall of walls) {
@@ -779,7 +1085,13 @@ function drawFighter(fighter: Fighter) {
   ctx.arc(fighter.x, fighter.y, fighter.radius, 0, TAU);
   ctx.fill();
 
-  ctx.fillStyle = "#1d2431";
+  if (fighter.helperType === "red") {
+    ctx.fillStyle = "#ff3b3b";
+  } else if (fighter.helperType === "green") {
+    ctx.fillStyle = "#43d86b";
+  } else {
+    ctx.fillStyle = fighter.isPlayer ? "#ffffff" : "#1d2431";
+  }
   ctx.fillRect(fighter.x - 4, fighter.y - 2, 3, 3);
   ctx.fillRect(fighter.x + 1, fighter.y - 2, 3, 3);
 
@@ -860,6 +1172,30 @@ function drawMedkits() {
   }
 }
 
+function drawStars() {
+  for (const star of stars) {
+    ctx.fillStyle = star.color === "blue" ? "#5fc1ff" : "#ff6b6b";
+    ctx.beginPath();
+    for (let i = 0; i < 10; i += 1) {
+      const angle = -Math.PI / 2 + i * (Math.PI / 5);
+      const radius = i % 2 === 0 ? 8 : 4;
+      const px = star.x + Math.cos(angle) * radius;
+      const py = star.y + Math.sin(angle) * radius;
+      if (i === 0) {
+        ctx.moveTo(px, py);
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = "#dff5ff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
 function drawExplosions() {
   for (const explosion of explosions) {
     const progress = explosion.timer / explosion.maxTimer;
@@ -880,7 +1216,7 @@ function drawExplosions() {
 
 function drawBullets() {
   for (const bullet of bullets) {
-    ctx.fillStyle = bullet.color;
+    ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
     ctx.fillRect(
       bullet.x - bullet.size / 2,
       bullet.y - bullet.size / 2,
@@ -891,7 +1227,7 @@ function drawBullets() {
 }
 
 function drawHud() {
-  const player = fighters.find((fighter) => fighter.isPlayer);
+  const player = fighters.find((fighter) => fighter.team === "player");
   if (!player) {
     return;
   }
@@ -899,13 +1235,15 @@ function drawHud() {
   const unlockedWeapons = getUnlockedWeapons(player.score);
 
   ctx.fillStyle = "rgba(14, 16, 24, 0.72)";
-  ctx.fillRect(8, 8, 96, 34);
+  ctx.fillRect(8, 8, 96, 54);
 
   ctx.fillStyle = "#f5e7c8";
   ctx.font = "bold 8px monospace";
   ctx.fillText(`HP ${Math.ceil(player.hp)}`, 14, 18);
   ctx.fillText(`Score ${player.score}`, 14, 28);
   ctx.fillText(getActivePlayerWeapon(player).toUpperCase(), 14, 38);
+  ctx.fillText(`CRIT ${Math.round(player.critChance * 100)}%`, 14, 48);
+  ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 58);
 
   const barY = WORLD_HEIGHT - 22;
   const startX = 14;
@@ -938,15 +1276,39 @@ function drawHud() {
   }
 }
 
+function drawPauseOverlay() {
+  if (!isPaused) {
+    return;
+  }
+
+  ctx.fillStyle = "rgba(10, 12, 18, 0.55)";
+  ctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+
+  ctx.fillStyle = "rgba(18, 24, 38, 0.92)";
+  ctx.fillRect(WORLD_WIDTH / 2 - 78, WORLD_HEIGHT / 2 - 26, 156, 52);
+
+  ctx.strokeStyle = "rgba(255, 240, 184, 0.4)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(WORLD_WIDTH / 2 - 78, WORLD_HEIGHT / 2 - 26, 156, 52);
+
+  ctx.fillStyle = "#fff1da";
+  ctx.font = "bold 14px monospace";
+  ctx.fillText("PAUSED", WORLD_WIDTH / 2 - 27, WORLD_HEIGHT / 2 - 2);
+  ctx.font = "bold 8px monospace";
+  ctx.fillText("PRESS P OR ESC", WORLD_WIDTH / 2 - 43, WORLD_HEIGHT / 2 + 16);
+}
+
 function render() {
   drawArena();
   drawSpawnWarnings();
   drawMedkits();
+  drawStars();
   drawBullets();
   drawExplosions();
   drawLightning();
   fighters.forEach(drawFighter);
   drawHud();
+  drawPauseOverlay();
 }
 
 let previous = performance.now();
@@ -954,7 +1316,9 @@ let previous = performance.now();
 function frame(now: number) {
   const dt = Math.min(0.033, (now - previous) / 1000);
   previous = now;
-  update(dt);
+  if (!isPaused) {
+    update(dt);
+  }
   render();
   requestAnimationFrame(frame);
 }
@@ -975,7 +1339,7 @@ function setMovementKey(code: string, isPressed: boolean) {
 }
 
 function trySelectWeapon(slot: number) {
-  const player = fighters.find((fighter) => fighter.isPlayer);
+  const player = fighters.find((fighter) => fighter.team === "player");
   if (!player) {
     return;
   }
@@ -990,8 +1354,21 @@ function trySelectWeapon(slot: number) {
   }
 }
 
+function togglePause() {
+  isPaused = !isPaused;
+  if (isPaused) {
+    input.shoot = false;
+  }
+}
+
 window.addEventListener("keydown", (event) => {
   if (event.repeat) {
+    return;
+  }
+
+  if (event.code === "KeyP" || event.code === "Escape") {
+    togglePause();
+    event.preventDefault();
     return;
   }
 
