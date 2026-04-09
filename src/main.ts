@@ -53,6 +53,7 @@ type Fighter = {
   shieldTimer: number;
   rageCharge: number;
   rageTimer: number;
+  rageCooldown: number;
 };
 
 type Bullet = {
@@ -153,8 +154,9 @@ const placedMines: PlacedMine[] = [];
 let shieldPickupCooldown = 18;
 const shieldPickups: ShieldPickup[] = [];
 const explosions: Explosion[] = [];
-const weaponOrder: WeaponType[] = ["pistol", "shotgun", "smg", "rifle", "bazooka"];
+const weaponOrder: WeaponType[] = ["pistol", "smg", "shotgun", "rifle", "bazooka"];
 let selectedWeapon: WeaponType = "pistol";
+let highestUnlockedWeapon: WeaponType = "pistol";
 let isPaused = false;
 let showRulesMenu = false;
 let rulesScroll = 0;
@@ -225,13 +227,16 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     shieldCount: 0,
     shieldTimer: 0,
     rageCharge: isPlayer ? 100 : 0,
-    rageTimer: 0
+    rageTimer: 0,
+    rageCooldown: 0
   };
 }
 
 function spawnRoster() {
   fighters.length = 0;
   bullets.length = 0;
+  selectedWeapon = "pistol";
+  highestUnlockedWeapon = "pistol";
   const playerSpawn = getSafeSpawnPoint(7);
   fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
 
@@ -312,6 +317,9 @@ function respawn(fighter: Fighter) {
     fighter.shieldTimer = 0;
     fighter.rageCharge = 100;
     fighter.rageTimer = 0;
+    fighter.rageCooldown = 0;
+    selectedWeapon = "pistol";
+    highestUnlockedWeapon = "pistol";
     spawnEnemyWave();
   }
   fighter.hp = fighter.maxHp;
@@ -419,8 +427,8 @@ function playShieldSound() {
 function getPlayerWeapon(score: number): WeaponType {
   if (score >= 20) return "bazooka";
   if (score >= 15) return "rifle";
-  if (score >= 10) return "smg";
-  if (score >= 5) return "shotgun";
+  if (score >= 10) return "shotgun";
+  if (score >= 5) return "smg";
   return "pistol";
 }
 
@@ -453,8 +461,8 @@ function createBullet(
 function getUnlockedWeapons(score: number) {
   return weaponOrder.filter((weapon) => {
     if (weapon === "pistol") return true;
-    if (weapon === "shotgun") return score >= 5;
-    if (weapon === "smg") return score >= 10;
+    if (weapon === "smg") return score >= 5;
+    if (weapon === "shotgun") return score >= 10;
     if (weapon === "rifle") return score >= 15;
     return score >= 20;
   });
@@ -462,9 +470,16 @@ function getUnlockedWeapons(score: number) {
 
 function getActivePlayerWeapon(player: Fighter) {
   const unlocked = getUnlockedWeapons(player.score);
-  if (!unlocked.includes(selectedWeapon)) {
-    selectedWeapon = unlocked[unlocked.length - 1];
+  const newestUnlocked = unlocked[unlocked.length - 1];
+
+  if (weaponOrder.indexOf(newestUnlocked) > weaponOrder.indexOf(highestUnlockedWeapon)) {
+    selectedWeapon = newestUnlocked;
+    highestUnlockedWeapon = newestUnlocked;
+  } else if (!unlocked.includes(selectedWeapon)) {
+    selectedWeapon = newestUnlocked;
+    highestUnlockedWeapon = newestUnlocked;
   }
+
   return selectedWeapon;
 }
 
@@ -512,12 +527,13 @@ function activateShield(player: Fighter) {
 }
 
 function activateRage(player: Fighter) {
-  if (player.rageCharge < 100 || player.rageTimer > 0) {
+  if (player.rageCharge < 100 || player.rageTimer > 0 || player.rageCooldown > 0) {
     return;
   }
 
   player.rageCharge = 0;
-  player.rageTimer = 6;
+  player.rageTimer = 10;
+  player.rageCooldown = 30;
   playTone("sawtooth", 420, 0.2, 0.04, 820);
 }
 
@@ -528,26 +544,37 @@ function shoot(fighter: Fighter) {
 
   if (fighter.isPlayer) {
     const weapon = getActivePlayerWeapon(fighter);
-    const rageReloadFactor = fighter.rageTimer > 0 ? 0.55 : 1;
+    const rageReloadFactor = fighter.rageTimer > 0 ? 0.45 : 1;
+    const rageSpeedFactor = fighter.rageTimer > 0 ? 2 : 1;
+    const playerSpeedFactor = 1.5;
 
     if (weapon === "pistol") {
-      fighter.reload = 0.1 * rageReloadFactor;
-      createBullet(fighter, fighter.dir, 176, 10, 24, 3, weapon);
+      fighter.reload = 0.2 * rageReloadFactor;
+      createBullet(fighter, fighter.dir, 176 * playerSpeedFactor * rageSpeedFactor, 10, 24, 3, weapon);
     } else if (weapon === "shotgun") {
-      fighter.reload = 0.42 * rageReloadFactor;
-      createBullet(fighter, fighter.dir - 0.2, 156, 10, 16, 3, weapon);
-      createBullet(fighter, fighter.dir - 0.07, 162, 10, 16, 3, weapon);
-      createBullet(fighter, fighter.dir + 0.07, 162, 10, 16, 3, weapon);
-      createBullet(fighter, fighter.dir + 0.2, 156, 10, 16, 3, weapon);
+      fighter.reload = 0.28 * rageReloadFactor;
+      createBullet(fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
+      createBullet(fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
+      createBullet(fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
+      createBullet(fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
+      createBullet(fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
     } else if (weapon === "smg") {
       fighter.reload = 0.06 * rageReloadFactor;
-      createBullet(fighter, fighter.dir + (Math.random() - 0.5) * 0.12, 188, 10, 14, 2, weapon);
+      createBullet(
+        fighter,
+        fighter.dir + (Math.random() - 0.5) * 0.12,
+        188 * playerSpeedFactor * rageSpeedFactor,
+        10,
+        14,
+        2,
+        weapon
+      );
     } else if (weapon === "rifle") {
-      fighter.reload = 0.16 * rageReloadFactor;
-      createBullet(fighter, fighter.dir, 240, 10, 34, 3, weapon);
+      fighter.reload = 0.08 * rageReloadFactor;
+      createBullet(fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon);
     } else {
-      fighter.reload = 0.55 * rageReloadFactor;
-      createBullet(fighter, fighter.dir, 132, 10, 80, 5, weapon);
+      fighter.reload = 0.275 * rageReloadFactor;
+      createBullet(fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon);
     }
   } else {
     fighter.reload = 0.34;
@@ -640,12 +667,14 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      const damage = enemy.shieldTimer > 0 ? 0 : 32;
+      const damage = enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 32;
       enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
       playHitSound(true);
-      if (enemy.shieldTimer > 0) {
+      if (enemy.rageTimer > 0) {
+        applyKnockback(bot, enemy.x, enemy.y, 22);
+      } else if (enemy.shieldTimer > 0) {
         applyKnockback(bot, enemy.x, enemy.y, 16);
       }
 
@@ -860,7 +889,7 @@ function explodeBazooka(bullet: Bullet) {
     }
 
     const falloff = 1 - distance / 30;
-    const damage = Math.max(18, Math.round(bullet.damage * falloff));
+    const damage = Math.max(40, Math.round(bullet.damage * falloff));
     fighter.hp -= damage;
     fighter.flash = 0.18;
     applyKnockback(fighter, bullet.x, bullet.y, 14 * falloff);
@@ -993,11 +1022,25 @@ function updateBullets(dt: number) {
       continue;
     }
 
-    const damage = target.shieldTimer > 0 ? 0 : bullet.damage;
+    const damage = target.rageTimer > 0 ? 0 : target.shieldTimer > 0 ? 0 : bullet.damage;
     target.hp -= damage;
     target.flash = 0.14;
     bullet.life = 0;
     playHitSound(false);
+
+    if (target.rageTimer > 0 && target.team === "player") {
+      const owner = fighters.find((fighter) => fighter.id === bullet.ownerId);
+      if (owner && owner.team === "enemy" && owner.respawn <= 0) {
+        owner.hp -= bullet.damage;
+        owner.flash = 0.18;
+        applyKnockback(owner, target.x, target.y, 18);
+        if (owner.hp <= 0) {
+          defeatFighter(owner, target);
+        }
+      }
+      continue;
+    }
+
     if (bullet.isCrit) {
       applyKnockback(target, bullet.x, bullet.y, 8);
     }
@@ -1223,6 +1266,10 @@ function updateLightning(dt: number) {
       const distanceFromLine = Math.abs(player.x - strike.x);
       if (distanceFromLine < 14) {
         player.hp -= 30;
+        if (player.rageTimer > 0) {
+          player.hp += 30;
+          player.hp -= 24;
+        }
         player.flash = 0.22;
         playHitSound(false);
 
@@ -1253,7 +1300,8 @@ function update(dt: number) {
     fighter.attackCooldown = Math.max(0, fighter.attackCooldown - dt);
     fighter.shieldTimer = Math.max(0, fighter.shieldTimer - dt);
     fighter.rageTimer = Math.max(0, fighter.rageTimer - dt);
-    if (fighter.team === "player" && fighter.rageTimer <= 0) {
+    fighter.rageCooldown = Math.max(0, fighter.rageCooldown - dt);
+    if (fighter.team === "player" && fighter.rageTimer <= 0 && fighter.rageCooldown <= 0) {
       fighter.rageCharge = Math.min(100, fighter.rageCharge + dt * 8);
     }
 
@@ -1314,6 +1362,16 @@ function drawFighter(fighter: Fighter) {
   const weaponReach = fighter.archetype === "melee" ? 4 : 6;
   const handX = fighter.x + Math.cos(fighter.dir) * weaponReach;
   const handY = fighter.y + Math.sin(fighter.dir) * weaponReach;
+
+  if (fighter.rageTimer > 0) {
+    const rainbow = ["#ff6464", "#ffb84d", "#fff36d", "#66f28a", "#68d5ff", "#ae7bff"];
+    const colorIndex = Math.floor(elapsed * 12) % rainbow.length;
+    ctx.strokeStyle = rainbow[colorIndex];
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(fighter.x, fighter.y, fighter.radius + 6, 0, TAU);
+    ctx.stroke();
+  }
 
   if (fighter.shieldTimer > 0) {
     ctx.strokeStyle = "rgba(95, 193, 255, 0.85)";
@@ -1553,10 +1611,14 @@ function drawHud() {
   ctx.fillStyle = "rgba(255, 110, 90, 0.22)";
   ctx.fillRect(112, 24, 70, 12);
   ctx.fillStyle = "rgba(255, 110, 90, 0.82)";
-  ctx.fillRect(112, 24, 70 * (player.rageTimer > 0 ? player.rageTimer / 6 : player.rageCharge / 100), 12);
+  ctx.fillRect(112, 24, 70 * (player.rageTimer > 0 ? player.rageTimer / 10 : player.rageCharge / 100), 12);
   ctx.fillStyle = "#fff1da";
   ctx.fillText(
-    player.rageTimer > 0 ? `RAGE ${player.rageTimer.toFixed(1)}s` : "SPACE RAGE",
+    player.rageTimer > 0
+      ? `RAGE ${player.rageTimer.toFixed(1)}s`
+      : player.rageCooldown > 0
+        ? `CD ${player.rageCooldown.toFixed(1)}s`
+        : "SPACE RAGE",
     116,
     34
   );
@@ -1579,7 +1641,7 @@ function drawHud() {
     ctx.strokeRect(x + 0.5, barY + 0.5, width - 1, 13);
 
     ctx.fillStyle = selected ? "#3e2410" : unlocked ? "#f5e7c8" : "rgba(245, 231, 200, 0.4)";
-    const threshold = weapon === "pistol" ? 0 : weapon === "shotgun" ? 5 : weapon === "smg" ? 10 : weapon === "rifle" ? 15 : 20;
+    const threshold = weapon === "pistol" ? 0 : weapon === "smg" ? 5 : weapon === "shotgun" ? 10 : weapon === "rifle" ? 15 : 20;
     ctx.fillText(`${index + 1}.${weapon.toUpperCase()} ${threshold}`, x + 5, barY + 9);
   });
 
