@@ -12,12 +12,16 @@ if (!ctx) {
   throw new Error("2D context not available");
 }
 
-const WORLD_WIDTH = 480;
-const WORLD_HEIGHT = 270;
+const IS_MOBILE_VIEWPORT = window.matchMedia("(pointer: coarse)").matches;
+const WORLD_WIDTH = IS_MOBILE_VIEWPORT ? 400 : 480;
+const WORLD_HEIGHT = IS_MOBILE_VIEWPORT ? 225 : 270;
 const TAU = Math.PI * 2;
 const AudioContextClass = window.AudioContext || (window as typeof window & {
   webkitAudioContext?: typeof AudioContext;
 }).webkitAudioContext;
+
+canvas.width = WORLD_WIDTH;
+canvas.height = WORLD_HEIGHT;
 
 type Fighter = {
   id: number;
@@ -137,17 +141,17 @@ const input = {
 };
 
 const touchControls = {
-  enabled: window.matchMedia("(pointer: coarse)").matches,
+  enabled: IS_MOBILE_VIEWPORT,
   moveId: -1,
   aimId: -1,
   moveBaseX: 70,
-  moveBaseY: WORLD_HEIGHT - 56,
+  moveBaseY: WORLD_HEIGHT - 72,
   moveStickX: 70,
-  moveStickY: WORLD_HEIGHT - 56,
+  moveStickY: WORLD_HEIGHT - 72,
   aimBaseX: WORLD_WIDTH - 70,
-  aimBaseY: WORLD_HEIGHT - 56,
+  aimBaseY: WORLD_HEIGHT - 72,
   aimStickX: WORLD_WIDTH - 70,
-  aimStickY: WORLD_HEIGHT - 56
+  aimStickY: WORLD_HEIGHT - 72
 };
 
 const walls: Wall[] = [];
@@ -1596,6 +1600,31 @@ function drawBullets() {
   }
 }
 
+function getMobileWeaponButtonRect(index: number) {
+  const width = 86;
+  const height = 14;
+  const gap = 4;
+  const totalWidth = weaponOrder.length * width + (weaponOrder.length - 1) * gap;
+  const startX = Math.round((WORLD_WIDTH - totalWidth) / 2);
+  const y = WORLD_HEIGHT - 38;
+
+  return {
+    x: startX + index * (width + gap),
+    y,
+    width,
+    height
+  };
+}
+
+function getMobileRageButtonRect() {
+  return {
+    x: WORLD_WIDTH - 70,
+    y: 8,
+    width: 58,
+    height: 18
+  };
+}
+
 function drawHud() {
   const player = fighters.find((fighter) => fighter.team === "player");
   if (!player) {
@@ -1625,41 +1654,61 @@ function drawHud() {
     ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, 116, 18);
   }
 
+  const rageRect = touchControls.enabled ? getMobileRageButtonRect() : { x: 112, y: 24, width: 70, height: 12 };
   ctx.fillStyle = "rgba(255, 110, 90, 0.22)";
-  ctx.fillRect(112, 24, 70, 12);
+  ctx.fillRect(rageRect.x, rageRect.y, rageRect.width, rageRect.height);
   ctx.fillStyle = "rgba(255, 110, 90, 0.82)";
-  ctx.fillRect(112, 24, 70 * (player.rageTimer > 0 ? player.rageTimer / 10 : player.rageCharge / 100), 12);
-  ctx.fillStyle = "#fff1da";
-  ctx.fillText(
-    player.rageTimer > 0
-      ? `RAGE ${player.rageTimer.toFixed(1)}s`
-      : player.rageCooldown > 0
-        ? `CD ${player.rageCooldown.toFixed(1)}s`
-        : "SPACE RAGE",
-    116,
-    34
+  ctx.fillRect(
+    rageRect.x,
+    rageRect.y,
+    rageRect.width * (player.rageTimer > 0 ? player.rageTimer / 10 : player.rageCharge / 100),
+    rageRect.height
   );
+  ctx.fillStyle = "#fff1da";
+  if (touchControls.enabled) {
+    ctx.font = "bold 7px monospace";
+    ctx.fillText(
+      player.rageTimer > 0 ? `RAGE ${player.rageTimer.toFixed(1)}`
+      : player.rageCooldown > 0 ? `CD ${player.rageCooldown.toFixed(1)}`
+      : "RAGE",
+      rageRect.x + 6,
+      rageRect.y + 7
+    );
+  } else {
+    ctx.fillText(
+      player.rageTimer > 0
+        ? `RAGE ${player.rageTimer.toFixed(1)}s`
+        : player.rageCooldown > 0
+          ? `CD ${player.rageCooldown.toFixed(1)}s`
+          : "SPACE RAGE",
+      116,
+      34
+    );
+  }
 
-  const barY = WORLD_HEIGHT - 22;
-  const startX = 14;
-  const width = 84;
-  const gap = 6;
+  const barY = touchControls.enabled ? WORLD_HEIGHT - 38 : WORLD_HEIGHT - 22;
+  const startX = touchControls.enabled ? 0 : 14;
+  const width = touchControls.enabled ? 86 : 84;
+  const gap = touchControls.enabled ? 4 : 6;
   ctx.font = "bold 7px monospace";
 
   weaponOrder.forEach((weapon, index) => {
-    const x = startX + index * (width + gap);
+    const rect = touchControls.enabled
+      ? getMobileWeaponButtonRect(index)
+      : { x: startX + index * (width + gap), y: barY, width, height: 14 };
+    const x = rect.x;
     const unlocked = unlockedWeapons.includes(weapon);
     const selected = weapon === getActivePlayerWeapon(player);
 
     ctx.fillStyle = selected ? "rgba(255, 186, 83, 0.92)" : unlocked ? "rgba(18, 24, 38, 0.86)" : "rgba(18, 24, 38, 0.42)";
-    ctx.fillRect(x, barY, width, 14);
+    ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
     ctx.strokeStyle = selected ? "#fff0b8" : unlocked ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.08)";
     ctx.lineWidth = 1;
-    ctx.strokeRect(x + 0.5, barY + 0.5, width - 1, 13);
+    ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
 
     ctx.fillStyle = selected ? "#3e2410" : unlocked ? "#f5e7c8" : "rgba(245, 231, 200, 0.4)";
     const threshold = weapon === "pistol" ? 0 : weapon === "smg" ? 5 : weapon === "shotgun" ? 10 : weapon === "rifle" ? 15 : 20;
-    ctx.fillText(`${index + 1}.${weapon.toUpperCase()} ${threshold}`, x + 5, barY + 9);
+    ctx.fillText(`${index + 1}.${weapon.toUpperCase()} ${threshold}`, x + 5, rect.y + 9);
   });
 
   if (player.respawn > 0) {
@@ -1896,9 +1945,21 @@ function updateTouchAim(clientX: number, clientY: number) {
   touchControls.aimStickY = touchControls.aimBaseY + dy * limited;
 
   if (distance > 3) {
-    input.mouseX = point.x;
-    input.mouseY = point.y;
+    const aimX = dx / distance;
+    const aimY = dy / distance;
+    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+
+    if (player) {
+      input.mouseX = player.x + aimX * 48;
+      input.mouseY = player.y + aimY * 48;
+    } else {
+      input.mouseX = point.x;
+      input.mouseY = point.y;
+    }
+
     input.shoot = true;
+  } else {
+    input.shoot = false;
   }
 }
 
@@ -1907,7 +1968,7 @@ function resetTouchMovement() {
   input.moveY = 0;
   touchControls.moveId = -1;
   touchControls.moveBaseX = 70;
-  touchControls.moveBaseY = WORLD_HEIGHT - 56;
+  touchControls.moveBaseY = WORLD_HEIGHT - 72;
   touchControls.moveStickX = touchControls.moveBaseX;
   touchControls.moveStickY = touchControls.moveBaseY;
 }
@@ -1916,7 +1977,7 @@ function resetTouchAim() {
   input.shoot = false;
   touchControls.aimId = -1;
   touchControls.aimBaseX = WORLD_WIDTH - 70;
-  touchControls.aimBaseY = WORLD_HEIGHT - 56;
+  touchControls.aimBaseY = WORLD_HEIGHT - 72;
   touchControls.aimStickX = touchControls.aimBaseX;
   touchControls.aimStickY = touchControls.aimBaseY;
 }
@@ -1939,7 +2000,29 @@ function handleTouchPress(clientX: number, clientY: number) {
     ) {
       showRulesMenu = true;
     }
+    return true;
   }
+
+  if (touchControls.enabled) {
+    const rageRect = getMobileRageButtonRect();
+    if (isInsideRect(point.x, point.y, rageRect.x, rageRect.y, rageRect.width, rageRect.height)) {
+      const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+      if (player) {
+        activateRage(player);
+      }
+      return true;
+    }
+
+    for (let index = 0; index < weaponOrder.length; index += 1) {
+      const rect = getMobileWeaponButtonRect(index);
+      if (isInsideRect(point.x, point.y, rect.x, rect.y, rect.width, rect.height)) {
+        trySelectWeapon(index);
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 window.addEventListener("keydown", (event) => {
@@ -2035,9 +2118,9 @@ canvas.addEventListener("touchstart", (event) => {
 
   for (const touch of event.changedTouches) {
     const point = getCanvasPoint(touch.clientX, touch.clientY);
-    handleTouchPress(touch.clientX, touch.clientY);
+    const consumed = handleTouchPress(touch.clientX, touch.clientY);
 
-    if (isPaused) {
+    if (isPaused || consumed) {
       continue;
     }
 
