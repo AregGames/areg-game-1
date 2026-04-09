@@ -129,9 +129,25 @@ const input = {
   down: false,
   left: false,
   right: false,
+  moveX: 0,
+  moveY: 0,
   shoot: false,
   mouseX: WORLD_WIDTH / 2,
   mouseY: WORLD_HEIGHT / 2
+};
+
+const touchControls = {
+  enabled: window.matchMedia("(pointer: coarse)").matches,
+  moveId: -1,
+  aimId: -1,
+  moveBaseX: 70,
+  moveBaseY: WORLD_HEIGHT - 56,
+  moveStickX: 70,
+  moveStickY: WORLD_HEIGHT - 56,
+  aimBaseX: WORLD_WIDTH - 70,
+  aimBaseY: WORLD_HEIGHT - 56,
+  aimStickX: WORLD_WIDTH - 70,
+  aimStickY: WORLD_HEIGHT - 56
 };
 
 const walls: Wall[] = [];
@@ -160,6 +176,7 @@ let highestUnlockedWeapon: WeaponType = "pistol";
 let isPaused = false;
 let showRulesMenu = false;
 let rulesScroll = 0;
+let rulesTouchY: number | null = null;
 const spawnPoints = [
   { x: 42, y: 38 },
   { x: 120, y: 92 },
@@ -617,8 +634,8 @@ function chooseHelperTarget(helper: Fighter) {
 }
 
 function updatePlayer(player: Fighter, dt: number) {
-  const moveX = Number(input.right) - Number(input.left);
-  const moveY = Number(input.down) - Number(input.up);
+  const moveX = clamp(Number(input.right) - Number(input.left) + input.moveX, -1, 1);
+  const moveY = clamp(Number(input.down) - Number(input.up) + input.moveY, -1, 1);
   const len = Math.hypot(moveX, moveY) || 1;
   player.vx = (moveX / len) * player.speed;
   player.vy = (moveY / len) * player.speed;
@@ -1733,6 +1750,44 @@ function drawPauseOverlay() {
   ctx.fillText("RULES", WORLD_WIDTH / 2 - 15, WORLD_HEIGHT / 2 + 23);
 }
 
+function drawTouchControls() {
+  if (!touchControls.enabled) {
+    return;
+  }
+
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(touchControls.moveBaseX, touchControls.moveBaseY, 24, 0, TAU);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(touchControls.aimBaseX, touchControls.aimBaseY, 24, 0, TAU);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(255, 255, 255, 0.14)";
+  ctx.beginPath();
+  ctx.arc(touchControls.moveBaseX, touchControls.moveBaseY, 11, 0, TAU);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(touchControls.aimBaseX, touchControls.aimBaseY, 11, 0, TAU);
+  ctx.fill();
+
+  ctx.fillStyle = "rgba(95, 193, 255, 0.35)";
+  ctx.beginPath();
+  ctx.arc(touchControls.moveStickX, touchControls.moveStickY, 9, 0, TAU);
+  ctx.fill();
+
+  ctx.fillStyle = "rgba(255, 120, 120, 0.35)";
+  ctx.beginPath();
+  ctx.arc(touchControls.aimStickX, touchControls.aimStickY, 9, 0, TAU);
+  ctx.fill();
+
+  ctx.restore();
+}
+
 function render() {
   drawArena();
   drawSpawnWarnings();
@@ -1746,6 +1801,7 @@ function render() {
   drawLightning();
   fighters.forEach(drawFighter);
   drawHud();
+  drawTouchControls();
   drawPauseOverlay();
 }
 
@@ -1761,12 +1817,20 @@ function frame(now: number) {
   requestAnimationFrame(frame);
 }
 
-function updateMousePosition(event: MouseEvent) {
+function getCanvasPoint(clientX: number, clientY: number) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = WORLD_WIDTH / rect.width;
   const scaleY = WORLD_HEIGHT / rect.height;
-  input.mouseX = (event.clientX - rect.left) * scaleX;
-  input.mouseY = (event.clientY - rect.top) * scaleY;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY
+  };
+}
+
+function updateMousePosition(event: MouseEvent) {
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  input.mouseX = point.x;
+  input.mouseY = point.y;
 }
 
 function isInsideRect(x: number, y: number, rectX: number, rectY: number, width: number, height: number) {
@@ -1803,6 +1867,78 @@ function togglePause() {
   } else {
     showRulesMenu = false;
     rulesScroll = 0;
+  }
+}
+
+function updateTouchMovement(clientX: number, clientY: number) {
+  const point = getCanvasPoint(clientX, clientY);
+  const dx = point.x - touchControls.moveBaseX;
+  const dy = point.y - touchControls.moveBaseY;
+  const maxDistance = 24;
+  const distance = Math.hypot(dx, dy);
+  const limited = distance > maxDistance ? maxDistance / distance : 1;
+
+  touchControls.moveStickX = touchControls.moveBaseX + dx * limited;
+  touchControls.moveStickY = touchControls.moveBaseY + dy * limited;
+  input.moveX = clamp(dx / maxDistance, -1, 1);
+  input.moveY = clamp(dy / maxDistance, -1, 1);
+}
+
+function updateTouchAim(clientX: number, clientY: number) {
+  const point = getCanvasPoint(clientX, clientY);
+  const dx = point.x - touchControls.aimBaseX;
+  const dy = point.y - touchControls.aimBaseY;
+  const maxDistance = 24;
+  const distance = Math.hypot(dx, dy);
+  const limited = distance > maxDistance ? maxDistance / distance : 1;
+
+  touchControls.aimStickX = touchControls.aimBaseX + dx * limited;
+  touchControls.aimStickY = touchControls.aimBaseY + dy * limited;
+
+  if (distance > 3) {
+    input.mouseX = point.x;
+    input.mouseY = point.y;
+    input.shoot = true;
+  }
+}
+
+function resetTouchMovement() {
+  input.moveX = 0;
+  input.moveY = 0;
+  touchControls.moveId = -1;
+  touchControls.moveBaseX = 70;
+  touchControls.moveBaseY = WORLD_HEIGHT - 56;
+  touchControls.moveStickX = touchControls.moveBaseX;
+  touchControls.moveStickY = touchControls.moveBaseY;
+}
+
+function resetTouchAim() {
+  input.shoot = false;
+  touchControls.aimId = -1;
+  touchControls.aimBaseX = WORLD_WIDTH - 70;
+  touchControls.aimBaseY = WORLD_HEIGHT - 56;
+  touchControls.aimStickX = touchControls.aimBaseX;
+  touchControls.aimStickY = touchControls.aimBaseY;
+}
+
+function handleTouchPress(clientX: number, clientY: number) {
+  const point = getCanvasPoint(clientX, clientY);
+
+  if (isPaused) {
+    rulesTouchY = point.y;
+    input.mouseX = point.x;
+    input.mouseY = point.y;
+    if (
+      showRulesMenu &&
+      isInsideRect(point.x, point.y, WORLD_WIDTH / 2 - 46, WORLD_HEIGHT / 2 + 52, 92, 14)
+    ) {
+      showRulesMenu = false;
+    } else if (
+      !showRulesMenu &&
+      isInsideRect(point.x, point.y, WORLD_WIDTH / 2 - 34, WORLD_HEIGHT / 2 + 14, 68, 14)
+    ) {
+      showRulesMenu = true;
+    }
   }
 }
 
@@ -1892,6 +2028,92 @@ canvas.addEventListener("mousedown", (event) => {
 
   input.shoot = true;
 });
+canvas.addEventListener("touchstart", (event) => {
+  ensureAudio();
+  audioContext?.resume();
+  touchControls.enabled = true;
+
+  for (const touch of event.changedTouches) {
+    const point = getCanvasPoint(touch.clientX, touch.clientY);
+    handleTouchPress(touch.clientX, touch.clientY);
+
+    if (isPaused) {
+      continue;
+    }
+
+    if (touchControls.moveId === -1 && point.x <= WORLD_WIDTH / 2) {
+      touchControls.moveId = touch.identifier;
+      touchControls.moveBaseX = point.x;
+      touchControls.moveBaseY = point.y;
+      touchControls.moveStickX = point.x;
+      touchControls.moveStickY = point.y;
+      input.moveX = 0;
+      input.moveY = 0;
+    } else if (touchControls.aimId === -1 && point.x > WORLD_WIDTH / 2) {
+      touchControls.aimId = touch.identifier;
+      touchControls.aimBaseX = point.x;
+      touchControls.aimBaseY = point.y;
+      touchControls.aimStickX = point.x;
+      touchControls.aimStickY = point.y;
+      updateTouchAim(touch.clientX, touch.clientY);
+    }
+  }
+
+  event.preventDefault();
+}, { passive: false });
+canvas.addEventListener("touchmove", (event) => {
+  touchControls.enabled = true;
+
+  if (isPaused && showRulesMenu) {
+    const touch = event.changedTouches[0];
+    if (touch) {
+      const point = getCanvasPoint(touch.clientX, touch.clientY);
+      if (rulesTouchY !== null) {
+        const lineHeight = 14;
+        const visibleHeight = 90;
+        const maxScroll = Math.max(0, rulesLines.length * lineHeight - visibleHeight);
+        rulesScroll = clamp(rulesScroll - (point.y - rulesTouchY), 0, maxScroll);
+      }
+      rulesTouchY = point.y;
+    }
+    event.preventDefault();
+    return;
+  }
+
+  for (const touch of event.changedTouches) {
+    if (touch.identifier === touchControls.moveId) {
+      updateTouchMovement(touch.clientX, touch.clientY);
+    }
+    if (touch.identifier === touchControls.aimId) {
+      updateTouchAim(touch.clientX, touch.clientY);
+    }
+  }
+
+  event.preventDefault();
+}, { passive: false });
+
+function releaseTouch(identifier: number) {
+  rulesTouchY = null;
+  if (identifier === touchControls.moveId) {
+    resetTouchMovement();
+  }
+  if (identifier === touchControls.aimId) {
+    resetTouchAim();
+  }
+}
+
+canvas.addEventListener("touchend", (event) => {
+  for (const touch of event.changedTouches) {
+    releaseTouch(touch.identifier);
+  }
+  event.preventDefault();
+}, { passive: false });
+canvas.addEventListener("touchcancel", (event) => {
+  for (const touch of event.changedTouches) {
+    releaseTouch(touch.identifier);
+  }
+  event.preventDefault();
+}, { passive: false });
 window.addEventListener("keydown", () => {
   ensureAudio();
   audioContext?.resume();
