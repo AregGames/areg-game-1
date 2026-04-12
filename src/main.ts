@@ -58,6 +58,7 @@ type Fighter = {
   rageCharge: number;
   rageTimer: number;
   rageCooldown: number;
+  isBoss: boolean;
 };
 
 type Bullet = {
@@ -91,6 +92,26 @@ type LightningStrike = {
   warning: number;
   active: boolean;
   hitApplied: boolean;
+};
+
+type Meteor = {
+  x: number;
+  y: number;
+  timer: number;
+  warning: number;
+  fallDuration: number;
+  active: boolean;
+  hitApplied: boolean;
+  radius: number;
+};
+
+type BurningFloor = {
+  x: number;
+  y: number;
+  radius: number;
+  timer: number;
+  maxTimer: number;
+  damageTick: number;
 };
 
 type Medkit = {
@@ -128,6 +149,8 @@ type Explosion = {
   maxTimer: number;
 };
 
+type BossAttackType = "targeted" | "forward" | "left" | "right";
+
 const input = {
   up: false,
   down: false,
@@ -164,6 +187,9 @@ let audioContext: AudioContext | null = null;
 let audioEnabled = false;
 let lightningCooldown = 2.4;
 const lightningStrikes: LightningStrike[] = [];
+let meteorCooldown = 5.2;
+const meteors: Meteor[] = [];
+const burningFloors: BurningFloor[] = [];
 let medkitCooldown = 4.5;
 const medkits: Medkit[] = [];
 let starCooldown = 8;
@@ -183,6 +209,21 @@ let rulesScroll = 0;
 let rulesTouchY: number | null = null;
 let mobileFullscreenAttempted = false;
 let pendingRunReset = false;
+let survivalWithoutDeath = 0;
+let bossFightStarted = false;
+let bossFightWon = false;
+let bossIntroTimer = 0;
+let bossAttackType: BossAttackType | null = null;
+let bossAttackWindup = 0;
+let bossAttackActive = 0;
+let bossAttackRecover = 0;
+let bossAttackIndex = 0;
+let bossAttackAngle = 0;
+let bossAttackHitApplied = false;
+let bossSpinDamageTick = 0;
+let bossesDefeated = 0;
+
+const bossAttackPattern: BossAttackType[] = ["targeted", "targeted", "forward", "left", "right", "left", "left"];
 
 const palette = [
   ["#57d7ff", "#dffaff"],
@@ -202,6 +243,9 @@ const rulesLines = [
   "RED HELPERS SHOOT ENEMIES.",
   "GREEN HELPERS FIRE HEALING SHOTS AT YOU.",
   "LIGHTNING WARNS FIRST, THEN STRIKES.",
+  "METEORS FALL INTO A 2X2 BLAST ZONE. KEEP MOVING.",
+  "AFTER 60s WITHOUT DYING, METEORS LEAVE BURNING GROUND.",
+  "AT 60s A SHIELDED BOSS TAKES OVER THE ARENA.",
   "P OR ESC PAUSES AND RESUMES.",
   "CLICK BACK TO RETURN TO THE PAUSE MENU.",
   "USE MOUSE WHEEL TO SCROLL THESE RULES."
@@ -243,7 +287,97 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     shieldTimer: 0,
     rageCharge: isPlayer ? 100 : 0,
     rageTimer: 0,
-    rageCooldown: 0
+    rageCooldown: 0,
+    isBoss: false
+  };
+}
+
+function getEnemyPressureLevel() {
+  return Math.min(6, Math.floor(survivalWithoutDeath / 30) + bossesDefeated * 2);
+}
+
+function getWaveEnemyCount() {
+  if (bossesDefeated >= 1) {
+    return 6;
+  }
+  if (survivalWithoutDeath >= 90) {
+    return 5;
+  }
+  return 4;
+}
+
+function getPhaseLabel() {
+  if (bossFightStarted) {
+    return "BOSS PHASE";
+  }
+  if (bossesDefeated >= 1) {
+    return "POST-BOSS SURGE";
+  }
+  if (survivalWithoutDeath >= 60) {
+    return "FIREFALL";
+  }
+  if (survivalWithoutDeath >= 30) {
+    return "STORM RISE";
+  }
+  return "SURVIVAL";
+}
+
+function getProgressBarState() {
+  if (bossFightStarted) {
+    return {
+      progress: 1,
+      label: "BOSS ACTIVE",
+      fill: "#ff8d6b"
+    };
+  }
+
+  if (bossesDefeated >= 1) {
+    return {
+      progress: Math.min(1, survivalWithoutDeath / 60),
+      label: "NEXT BOSS",
+      fill: "#ffcf6b"
+    };
+  }
+
+  return {
+    progress: Math.min(1, survivalWithoutDeath / 60),
+    label: "BOSS INCOMING",
+    fill: "#7ee0ff"
+  };
+}
+
+function applyEnemyScaling(enemy: Fighter, waveIndex = 0) {
+  const pressure = getEnemyPressureLevel();
+  const elite = pressure >= 3 && (waveIndex === getWaveEnemyCount() - 1 || Math.random() < 0.16 + bossesDefeated * 0.06);
+
+  enemy.archetype = pressure >= 2 && Math.random() < 0.4 ? "ranged" : Math.random() < 0.78 ? "melee" : "ranged";
+  enemy.radius = elite ? 9 : 7;
+  enemy.maxHp = (elite ? 150 : 100) + pressure * (elite ? 22 : 14);
+  enemy.hp = enemy.maxHp;
+  enemy.speed = (elite ? 56 : 50) + pressure * (elite ? 2.4 : 1.6);
+  enemy.damageMultiplier = (elite ? 1.28 : 1) + pressure * 0.08;
+
+  if (elite) {
+    enemy.color = "#4f5967";
+    enemy.accent = "#ffd39f";
+  }
+}
+
+function getLightningSettings() {
+  const pressure = getEnemyPressureLevel();
+  return {
+    minCooldown: Math.max(0.95, 1.8 - pressure * 0.12),
+    maxCooldown: Math.max(1.45, 4.2 - pressure * 0.26),
+    damage: 30 + pressure * 2
+  };
+}
+
+function getMeteorSettings() {
+  const pressure = getEnemyPressureLevel();
+  return {
+    minCooldown: Math.max(2.1, 4.2 - pressure * 0.22),
+    maxCooldown: Math.max(3.2, 7.3 - pressure * 0.28),
+    damage: 36 + pressure * 3
   };
 }
 
@@ -251,6 +385,8 @@ function spawnRoster() {
   fighters.length = 0;
   bullets.length = 0;
   lightningStrikes.length = 0;
+  meteors.length = 0;
+  burningFloors.length = 0;
   medkits.length = 0;
   stars.length = 0;
   minePickups.length = 0;
@@ -258,6 +394,7 @@ function spawnRoster() {
   shieldPickups.length = 0;
   explosions.length = 0;
   lightningCooldown = 2.4;
+  meteorCooldown = 5.2;
   medkitCooldown = 4.5;
   starCooldown = 8;
   minePickupCooldown = 9;
@@ -265,6 +402,19 @@ function spawnRoster() {
   selectedWeapon = "pistol";
   highestUnlockedWeapon = "pistol";
   pendingRunReset = false;
+  survivalWithoutDeath = 0;
+  bossFightStarted = false;
+  bossFightWon = false;
+  bossIntroTimer = 0;
+  bossAttackType = null;
+  bossAttackWindup = 0;
+  bossAttackActive = 0;
+  bossAttackRecover = 0;
+  bossAttackIndex = 0;
+  bossAttackAngle = 0;
+  bossAttackHitApplied = false;
+  bossSpinDamageTick = 0;
+  bossesDefeated = 0;
   const playerSpawn = getRandomSpawnPoint(7);
   fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
 
@@ -272,16 +422,88 @@ function spawnRoster() {
 }
 
 function spawnEnemyWave() {
-  const enemyPaletteOrder = [1, 2, 3, 1];
+  const enemyPaletteOrder = [1, 2, 3, 1, 2, 3];
+  const waveCount = getWaveEnemyCount();
   const reservedSpawns = fighters
     .filter((fighter) => fighter.respawn <= 0)
     .map((fighter) => ({ x: fighter.x, y: fighter.y, radius: fighter.radius }));
 
-  for (const colorIndex of enemyPaletteOrder) {
-    const botSpawn = getRandomSpawnPoint(7, undefined, reservedSpawns);
-    reservedSpawns.push({ x: botSpawn.x, y: botSpawn.y, radius: 7 });
-    fighters.push(createFighter(botSpawn.x, botSpawn.y, false, colorIndex));
+  for (let index = 0; index < waveCount; index += 1) {
+    const colorIndex = enemyPaletteOrder[index % enemyPaletteOrder.length];
+    const enemy = createFighter(0, 0, false, colorIndex);
+    applyEnemyScaling(enemy, index);
+    const botSpawn = getRandomSpawnPoint(enemy.radius, undefined, reservedSpawns);
+    enemy.x = botSpawn.x;
+    enemy.y = botSpawn.y;
+    enemy.spawnX = botSpawn.x;
+    enemy.spawnY = botSpawn.y;
+    reservedSpawns.push({ x: botSpawn.x, y: botSpawn.y, radius: enemy.radius });
+    fighters.push(enemy);
   }
+}
+
+function getBoss() {
+  return fighters.find((fighter) => fighter.isBoss && fighter.respawn <= 0) ?? null;
+}
+
+function getBossArenaRadius() {
+  return Math.min(WORLD_WIDTH, WORLD_HEIGHT) * 0.42;
+}
+
+function clearAmbientHazards() {
+  bullets.length = 0;
+  lightningStrikes.length = 0;
+  meteors.length = 0;
+  burningFloors.length = 0;
+  medkits.length = 0;
+  stars.length = 0;
+  minePickups.length = 0;
+  placedMines.length = 0;
+  shieldPickups.length = 0;
+  explosions.length = 0;
+}
+
+function startBossFight() {
+  if (bossFightStarted || bossFightWon) {
+    return;
+  }
+
+  despawnEnemies();
+  clearAmbientHazards();
+
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
+  if (player) {
+    player.x = WORLD_WIDTH / 2;
+    player.y = WORLD_HEIGHT / 2 + 58;
+    player.vx = 0;
+    player.vy = 0;
+  }
+
+  const boss = createFighter(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, false, 1);
+  boss.isBoss = true;
+  boss.team = "enemy";
+  boss.archetype = "melee";
+  boss.radius = 18;
+  boss.speed = 0;
+  boss.hp = 1500;
+  boss.maxHp = 1500;
+  boss.color = "#6d7686";
+  boss.accent = "#cfd7df";
+  boss.dir = -Math.PI / 2;
+  boss.flash = 0;
+  boss.attackCooldown = 0;
+  fighters.push(boss);
+
+  bossFightStarted = true;
+  bossIntroTimer = 5.5;
+  bossAttackType = null;
+  bossAttackWindup = 0;
+  bossAttackActive = 0;
+  bossAttackRecover = 0;
+  bossAttackIndex = 0;
+  bossAttackAngle = boss.dir;
+  bossAttackHitApplied = false;
+  bossSpinDamageTick = 0.28;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -299,6 +521,15 @@ function intersectsWall(x: number, y: number, radius: number) {
 }
 
 function canMoveTo(x: number, y: number, radius: number) {
+  if (bossFightStarted) {
+    const arenaRadius = getBossArenaRadius();
+    const dx = x - WORLD_WIDTH / 2;
+    const dy = y - WORLD_HEIGHT / 2;
+    if (Math.hypot(dx, dy) > arenaRadius - radius) {
+      return false;
+    }
+  }
+
   return (
     x - radius > 8 &&
     x + radius < WORLD_WIDTH - 8 &&
@@ -365,7 +596,13 @@ function getRandomSpawnPoint(
 }
 
 function respawn(fighter: Fighter) {
-  const point = getRandomSpawnPoint(fighter.radius, fighter.id);
+  if (!fighter.isPlayer) {
+    applyEnemyScaling(fighter);
+  }
+  const hasReservedSpawn = fighter.team === "enemy" && (fighter.spawnX !== 0 || fighter.spawnY !== 0);
+  const point = hasReservedSpawn
+    ? { x: fighter.spawnX, y: fighter.spawnY }
+    : getRandomSpawnPoint(fighter.radius, fighter.id);
   fighter.spawnX = point.x;
   fighter.spawnY = point.y;
   fighter.x = point.x;
@@ -390,9 +627,6 @@ function respawn(fighter: Fighter) {
   fighter.hp = fighter.maxHp;
   fighter.respawn = 0;
   fighter.attackCooldown = 0;
-  if (!fighter.isPlayer) {
-    fighter.archetype = Math.random() < 0.8 ? "melee" : "ranged";
-  }
 }
 
 function lineBlocked(aX: number, aY: number, bX: number, bY: number) {
@@ -462,6 +696,11 @@ function playDefeatSound() {
 function playLightningSound() {
   playTone("sawtooth", 820, 0.12, 0.05, 220);
   playTone("triangle", 180, 0.18, 0.03, 90);
+}
+
+function playMeteorSound() {
+  playTone("sawtooth", 210, 0.16, 0.05, 120);
+  playTone("triangle", 110, 0.22, 0.04, 70);
 }
 
 function playPickupSound() {
@@ -558,8 +797,8 @@ function createHelper(type: "red" | "green", player: Fighter) {
   helper.team = "ally";
   helper.helperType = type;
   helper.archetype = "ranged";
-  helper.hp = 1000;
-  helper.maxHp = 1000;
+  helper.hp = type === "green" ? 750 : 1000;
+  helper.maxHp = type === "green" ? 750 : 1000;
   helper.speed = type === "red" ? 56 : 60;
   helper.damageMultiplier = 1;
   helper.critChance = 0;
@@ -598,7 +837,7 @@ function activateRage(player: Fighter) {
 
   player.rageCharge = 0;
   player.rageTimer = 10;
-  player.rageCooldown = 30;
+  player.rageCooldown = 45;
   playTone("sawtooth", 420, 0.2, 0.04, 820);
 }
 
@@ -732,7 +971,7 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      const damage = enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 16;
+      const damage = enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 10;
       enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
@@ -844,6 +1083,179 @@ function updateHelper(helper: Fighter, dt: number) {
   moveFighter(helper, dt);
 }
 
+function getBossTargets() {
+  return fighters.filter(
+    (fighter) => (fighter.team === "player" || fighter.team === "ally") && fighter.respawn <= 0
+  );
+}
+
+function angleDifference(a: number, b: number) {
+  let diff = a - b;
+  while (diff > Math.PI) diff -= TAU;
+  while (diff < -Math.PI) diff += TAU;
+  return Math.abs(diff);
+}
+
+function distanceToSegment(
+  pointX: number,
+  pointY: number,
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number
+) {
+  const segX = endX - startX;
+  const segY = endY - startY;
+  const segLengthSq = segX * segX + segY * segY || 1;
+  const t = clamp(((pointX - startX) * segX + (pointY - startY) * segY) / segLengthSq, 0, 1);
+  const nearestX = startX + segX * t;
+  const nearestY = startY + segY * t;
+  return Math.hypot(pointX - nearestX, pointY - nearestY);
+}
+
+function bossShieldActive() {
+  return bossFightStarted && bossIntroTimer > 0;
+}
+
+function queueBossAttack(boss: Fighter, player: Fighter | null) {
+  bossAttackType = bossAttackPattern[bossAttackIndex % bossAttackPattern.length];
+  bossAttackWindup = bossAttackType === "forward" ? 0.95 : bossAttackType === "targeted" ? 0.8 : 1.05;
+  bossAttackActive = 0.22;
+  bossAttackRecover = 0.35;
+  bossAttackHitApplied = false;
+
+  if (bossAttackType === "targeted" && player) {
+    bossAttackAngle = Math.atan2(player.y - boss.y, player.x - boss.x);
+  } else if (bossAttackType === "forward") {
+    bossAttackAngle = player ? Math.atan2(player.y - boss.y, player.x - boss.x) : boss.dir;
+  } else {
+    bossAttackAngle = boss.dir;
+  }
+
+  boss.dir = bossAttackAngle;
+}
+
+function applyBossAttack(boss: Fighter) {
+  const targets = getBossTargets();
+
+  for (const target of targets) {
+    let hit = false;
+
+    if (bossAttackType === "targeted" || bossAttackType === "forward") {
+      const dx = target.x - boss.x;
+      const dy = target.y - boss.y;
+      const dist = Math.hypot(dx, dy);
+      const angleToTarget = Math.atan2(dy, dx);
+      const maxDistance = bossAttackType === "forward" ? 104 : 80;
+      const arc = bossAttackType === "forward" ? 0.42 : 0.52;
+      hit = dist <= maxDistance && angleDifference(angleToTarget, bossAttackAngle) <= arc;
+    } else if (bossAttackType === "left") {
+      hit = target.x <= WORLD_WIDTH / 2;
+    } else if (bossAttackType === "right") {
+      hit = target.x >= WORLD_WIDTH / 2;
+    }
+
+    if (!hit) {
+      continue;
+    }
+
+    damageHazardTarget(target, bossAttackType === "forward" ? 26 : bossAttackType === "targeted" ? 30 : 24, boss.x, boss.y, 20);
+  }
+}
+
+function updateBoss(boss: Fighter, dt: number) {
+  boss.vx = 0;
+  boss.vy = 0;
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
+  if (player && bossIntroTimer <= 0 && bossAttackType !== "targeted") {
+    boss.dir = Math.atan2(player.y - boss.y, player.x - boss.x);
+  }
+
+  if (bossIntroTimer > 0) {
+    bossIntroTimer = Math.max(0, bossIntroTimer - dt);
+    boss.dir += dt * 1.7;
+    bossSpinDamageTick -= dt;
+
+    if (bossSpinDamageTick <= 0) {
+      const swordLength = getBossArenaRadius() - 4;
+      const swordStartX = boss.x + Math.cos(boss.dir) * (boss.radius - 2);
+      const swordStartY = boss.y + Math.sin(boss.dir) * (boss.radius - 2);
+      const swordEndX = boss.x + Math.cos(boss.dir) * swordLength;
+      const swordEndY = boss.y + Math.sin(boss.dir) * swordLength;
+
+      for (const target of getBossTargets()) {
+        const distanceFromBlade = distanceToSegment(
+          target.x,
+          target.y,
+          swordStartX,
+          swordStartY,
+          swordEndX,
+          swordEndY
+        );
+        if (distanceFromBlade <= target.radius + 4) {
+          damageHazardTarget(target, 12, boss.x, boss.y, 0);
+        }
+      }
+      bossSpinDamageTick = 0.28;
+    }
+
+    if (bossIntroTimer <= 0) {
+      queueBossAttack(boss, player);
+    }
+    return;
+  }
+
+  if (!bossAttackType) {
+    queueBossAttack(boss, player);
+    return;
+  }
+
+  if (bossAttackWindup > 0) {
+    bossAttackWindup = Math.max(0, bossAttackWindup - dt);
+    boss.dir = bossAttackType === "left" ? Math.PI : bossAttackType === "right" ? 0 : bossAttackAngle;
+    return;
+  }
+
+  if (bossAttackActive > 0) {
+    bossAttackActive = Math.max(0, bossAttackActive - dt);
+    if (!bossAttackHitApplied) {
+      applyBossAttack(boss);
+      bossAttackHitApplied = true;
+    }
+    return;
+  }
+
+  bossAttackRecover = Math.max(0, bossAttackRecover - dt);
+  if (bossAttackRecover <= 0) {
+    bossAttackIndex = (bossAttackIndex + 1) % bossAttackPattern.length;
+    queueBossAttack(boss, player);
+  }
+}
+
+function reflectBulletOffBoss(bullet: Bullet, boss: Fighter) {
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0)
+    ?? getBossTargets()[0]
+    ?? null;
+
+  if (!player) {
+    bullet.life = 0;
+    return;
+  }
+
+  const angle = Math.atan2(player.y - boss.y, player.x - boss.x);
+  const speed = Math.hypot(bullet.vx, bullet.vy) || 150;
+  bullet.ownerId = boss.id;
+  bullet.vx = Math.cos(angle) * speed;
+  bullet.vy = Math.sin(angle) * speed;
+  bullet.x = boss.x + Math.cos(angle) * (boss.radius + 6);
+  bullet.y = boss.y + Math.sin(angle) * (boss.radius + 6);
+  bullet.life = Math.max(1, bullet.life);
+  bullet.color = "#d8e5f0";
+  bullet.isCrit = false;
+  bullet.healAmount = 0;
+  playHitSound(false);
+}
+
 function moveFighter(fighter: Fighter, dt: number) {
   const nextX = fighter.x + fighter.vx * dt;
   const nextY = fighter.y + fighter.vy * dt;
@@ -895,12 +1307,27 @@ function clearRunStateOnPlayerDeath() {
   despawnEnemies();
   bullets.length = 0;
   lightningStrikes.length = 0;
+  meteors.length = 0;
+  burningFloors.length = 0;
   medkits.length = 0;
   stars.length = 0;
   minePickups.length = 0;
   placedMines.length = 0;
   shieldPickups.length = 0;
   explosions.length = 0;
+  survivalWithoutDeath = 0;
+  bossFightStarted = false;
+  bossFightWon = false;
+  bossIntroTimer = 0;
+  bossAttackType = null;
+  bossAttackWindup = 0;
+  bossAttackActive = 0;
+  bossAttackRecover = 0;
+  bossAttackIndex = 0;
+  bossAttackAngle = 0;
+  bossAttackHitApplied = false;
+  bossSpinDamageTick = 0;
+  bossesDefeated = 0;
 
   for (let i = fighters.length - 1; i >= 0; i -= 1) {
     if (fighters[i].team === "ally") {
@@ -919,11 +1346,39 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
     return;
   }
 
+  if (target.isBoss) {
+    const index = fighters.findIndex((fighter) => fighter.id === target.id);
+    if (index >= 0) {
+      fighters.splice(index, 1);
+    }
+    bossFightStarted = false;
+    bossFightWon = false;
+    bossIntroTimer = 0;
+    bossAttackType = null;
+    bossAttackWindup = 0;
+    bossAttackActive = 0;
+    bossAttackRecover = 0;
+    bossAttackHitApplied = false;
+    bossesDefeated += 1;
+    survivalWithoutDeath = 0;
+    clearAmbientHazards();
+    spawnEnemyWave();
+    if (owner) {
+      owner.score += 10;
+    }
+    playDefeatSound();
+    return;
+  }
+
   target.respawn = 2.2;
   target.hp = 0;
   if (target.team === "player") {
     clearRunStateOnPlayerDeath();
     pendingRunReset = true;
+  } else {
+    const point = getRandomSpawnPoint(target.radius, target.id);
+    target.spawnX = point.x;
+    target.spawnY = point.y;
   }
   if (owner) {
     owner.score += 1;
@@ -1049,13 +1504,25 @@ function updateBullets(dt: number) {
       }
     }
 
+    const boss = getBoss();
+    const owner = fighters.find((candidate) => candidate.id === bullet.ownerId) ?? null;
+    if (
+      boss &&
+      bossShieldActive() &&
+      owner &&
+      owner.team !== "enemy" &&
+      Math.hypot(bullet.x - boss.x, bullet.y - boss.y) < boss.radius + 12 + bullet.size
+    ) {
+      reflectBulletOffBoss(bullet, boss);
+      continue;
+    }
+
     if (bullet.weapon === "bazooka") {
       const splashTarget = fighters
         .filter((fighter) => {
           if (fighter.id === bullet.ownerId || fighter.respawn > 0) {
             return false;
           }
-          const owner = fighters.find((candidate) => candidate.id === bullet.ownerId);
           if (!canHitTarget(owner ?? null, fighter)) {
             return false;
           }
@@ -1092,7 +1559,6 @@ function updateBullets(dt: number) {
         if (fighter.id === bullet.ownerId || fighter.respawn > 0) {
           return false;
         }
-        const owner = fighters.find((candidate) => candidate.id === bullet.ownerId);
         if (!canHitTarget(owner ?? null, fighter)) {
           return false;
         }
@@ -1120,7 +1586,6 @@ function updateBullets(dt: number) {
     playHitSound(false);
 
     if (target.rageTimer > 0 && target.team === "player") {
-      const owner = fighters.find((fighter) => fighter.id === bullet.ownerId);
       if (owner && owner.team === "enemy" && owner.respawn <= 0) {
         owner.hp -= bullet.damage;
         owner.flash = 0.18;
@@ -1136,7 +1601,6 @@ function updateBullets(dt: number) {
       applyKnockback(target, bullet.x, bullet.y, 8);
     }
 
-    const owner = fighters.find((fighter) => fighter.id === bullet.ownerId);
     if (target.hp <= 0) {
       defeatFighter(target, owner);
     }
@@ -1336,10 +1800,12 @@ function spawnLightningStrike() {
 }
 
 function updateLightning(dt: number) {
+  const lightningSettings = getLightningSettings();
   lightningCooldown -= dt;
   if (lightningCooldown <= 0) {
     spawnLightningStrike();
-    lightningCooldown = 1.8 + Math.random() * 2.4;
+    lightningCooldown =
+      lightningSettings.minCooldown + Math.random() * (lightningSettings.maxCooldown - lightningSettings.minCooldown);
   }
 
   const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
@@ -1356,10 +1822,10 @@ function updateLightning(dt: number) {
     if (strike.active && !strike.hitApplied && player) {
       const distanceFromLine = Math.abs(player.x - strike.x);
       if (distanceFromLine < 14) {
-        player.hp -= 30;
+        player.hp -= lightningSettings.damage;
         if (player.rageTimer > 0) {
-          player.hp += 30;
-          player.hp -= 24;
+          player.hp += lightningSettings.damage;
+          player.hp -= Math.round(lightningSettings.damage * 0.8);
         }
         player.flash = 0.22;
         playHitSound(false);
@@ -1383,9 +1849,134 @@ function updateLightning(dt: number) {
   }
 }
 
+function spawnMeteor() {
+  meteors.push({
+    x: 32 + Math.random() * (WORLD_WIDTH - 64),
+    y: 32 + Math.random() * (WORLD_HEIGHT - 64),
+    timer: 0.85,
+    warning: 0.85,
+    fallDuration: 0.34,
+    active: false,
+    hitApplied: false,
+    radius: 16
+  });
+}
+
+function spawnBurningFloor(x: number, y: number, radius: number) {
+  burningFloors.push({
+    x,
+    y,
+    radius,
+    timer: 5,
+    maxTimer: 5,
+    damageTick: 0.45
+  });
+}
+
+function damageHazardTarget(target: Fighter, damage: number, sourceX: number, sourceY: number, knockback: number) {
+  const appliedDamage = target.rageTimer > 0 ? Math.max(0, Math.round(damage * 0.28)) : target.shieldTimer > 0 ? 0 : damage;
+  target.hp -= appliedDamage;
+  target.flash = 0.2;
+  if (knockback > 0) {
+    applyKnockback(target, sourceX, sourceY, knockback);
+  }
+  playHitSound(false);
+
+  if (target.hp <= 0) {
+    defeatFighter(target, null);
+  }
+}
+
+function updateBurningFloors(dt: number) {
+  const hazardTargets = fighters.filter(
+    (fighter) => (fighter.team === "player" || fighter.team === "ally") && fighter.respawn <= 0
+  );
+
+  for (const floor of burningFloors) {
+    floor.timer -= dt;
+    floor.damageTick -= dt;
+
+    if (hazardTargets.length === 0) {
+      continue;
+    }
+
+    const insideFire = hazardTargets.filter(
+      (target) => Math.abs(target.x - floor.x) <= floor.radius && Math.abs(target.y - floor.y) <= floor.radius
+    );
+    if (insideFire.length > 0 && floor.damageTick <= 0) {
+      for (const target of insideFire) {
+        damageHazardTarget(target, 8, floor.x, floor.y, 0);
+      }
+      floor.damageTick = 0.45;
+    }
+  }
+
+  for (let i = burningFloors.length - 1; i >= 0; i -= 1) {
+    if (burningFloors[i].timer <= 0) {
+      burningFloors.splice(i, 1);
+    }
+  }
+}
+
+function updateMeteors(dt: number) {
+  const meteorSettings = getMeteorSettings();
+  meteorCooldown -= dt;
+  if (meteorCooldown <= 0) {
+    spawnMeteor();
+    meteorCooldown =
+      meteorSettings.minCooldown + Math.random() * (meteorSettings.maxCooldown - meteorSettings.minCooldown);
+  }
+
+  const hazardTargets = fighters.filter(
+    (fighter) => (fighter.team === "player" || fighter.team === "ally") && fighter.respawn <= 0
+  );
+
+  for (const meteor of meteors) {
+    meteor.timer -= dt;
+
+    if (!meteor.active && meteor.timer <= 0) {
+      meteor.active = true;
+      meteor.timer = meteor.fallDuration;
+    }
+
+    if (meteor.active && !meteor.hitApplied && meteor.timer <= 0) {
+      addExplosion(meteor.x, meteor.y, meteor.radius);
+      playMeteorSound();
+
+      for (const target of hazardTargets) {
+        const insideBlast = Math.abs(target.x - meteor.x) <= meteor.radius && Math.abs(target.y - meteor.y) <= meteor.radius;
+        if (insideBlast) {
+          damageHazardTarget(target, meteorSettings.damage, meteor.x, meteor.y, 16);
+        }
+      }
+
+      if (survivalWithoutDeath >= 60) {
+        spawnBurningFloor(meteor.x, meteor.y, meteor.radius);
+      }
+
+      meteor.hitApplied = true;
+    }
+  }
+
+  for (let i = meteors.length - 1; i >= 0; i -= 1) {
+    if (meteors[i].active && meteors[i].hitApplied) {
+      meteors.splice(i, 1);
+    }
+  }
+}
+
 function update(dt: number) {
   elapsed += dt;
   let shouldResetRoster = false;
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+
+  if (player) {
+    survivalWithoutDeath += dt;
+  }
+
+  if (player && survivalWithoutDeath >= 60 && !bossFightStarted && !bossFightWon) {
+    startBossFight();
+  }
 
   for (const fighter of fighters) {
     fighter.reload = Math.max(0, fighter.reload - dt);
@@ -1393,7 +1984,9 @@ function update(dt: number) {
     fighter.attackCooldown = Math.max(0, fighter.attackCooldown - dt);
     fighter.shieldTimer = Math.max(0, fighter.shieldTimer - dt);
     fighter.rageTimer = Math.max(0, fighter.rageTimer - dt);
-    fighter.rageCooldown = Math.max(0, fighter.rageCooldown - dt);
+    if (fighter.rageTimer <= 0) {
+      fighter.rageCooldown = Math.max(0, fighter.rageCooldown - dt);
+    }
     if (fighter.team === "player" && fighter.rageTimer <= 0 && fighter.rageCooldown <= 0) {
       fighter.rageCharge = Math.min(100, fighter.rageCharge + dt * 8);
     }
@@ -1414,6 +2007,8 @@ function update(dt: number) {
       updatePlayer(fighter, dt);
     } else if (fighter.team === "ally") {
       updateHelper(fighter, dt);
+    } else if (fighter.isBoss) {
+      updateBoss(fighter, dt);
     } else {
       updateBot(fighter, dt);
     }
@@ -1421,12 +2016,16 @@ function update(dt: number) {
 
   updateBullets(dt);
   updateExplosions(dt);
-  updateLightning(dt);
-  updateMedkits(dt);
-  updateMinePickups(dt);
-  updateShieldPickups(dt);
-  updatePlacedMines();
-  updateStars(dt);
+  if (!bossFightStarted) {
+    updateLightning(dt);
+    updateMeteors(dt);
+    updateBurningFloors(dt);
+    updateMedkits(dt);
+    updateMinePickups(dt);
+    updateShieldPickups(dt);
+    updatePlacedMines();
+    updateStars(dt);
+  }
 
   if (shouldResetRoster) {
     spawnRoster();
@@ -1452,10 +2051,90 @@ function drawArena() {
     ctx.fillStyle = "#734929";
     ctx.fillRect(wall.x, wall.y + wall.h - 3, wall.w, 3);
   }
+
+  if (bossFightStarted) {
+    const arenaRadius = getBossArenaRadius();
+
+    ctx.save();
+    ctx.fillStyle = "rgba(8, 10, 16, 0.72)";
+    ctx.beginPath();
+    ctx.rect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+    ctx.arc(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, arenaRadius, 0, TAU, true);
+    ctx.fill("evenodd");
+
+    ctx.strokeStyle = "rgba(255, 198, 128, 0.6)";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, arenaRadius, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function drawFighter(fighter: Fighter) {
   if (fighter.respawn > 0) {
+    return;
+  }
+
+  if (fighter.isBoss) {
+    const swordAngle =
+      bossIntroTimer > 0
+        ? fighter.dir
+        : bossAttackType === "left"
+          ? Math.PI
+          : bossAttackType === "right"
+            ? 0
+            : bossAttackAngle || fighter.dir;
+    const swordReach = fighter.isBoss ? getBossArenaRadius() - 4 : 24;
+    const swordX = fighter.x + Math.cos(swordAngle) * swordReach;
+    const swordY = fighter.y + Math.sin(swordAngle) * swordReach;
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.28)";
+    ctx.beginPath();
+    ctx.ellipse(fighter.x, fighter.y + 9, fighter.radius + 8, fighter.radius - 2, 0, 0, TAU);
+    ctx.fill();
+
+    if (bossShieldActive()) {
+      ctx.strokeStyle = `rgba(180, 215, 255, ${0.65 + Math.sin(elapsed * 10) * 0.18})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(fighter.x, fighter.y, fighter.radius + 12, 0, TAU);
+      ctx.stroke();
+    }
+
+    ctx.strokeStyle = "#d9dde4";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(fighter.x, fighter.y);
+    ctx.lineTo(swordX, swordY);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#5c4434";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(fighter.x, fighter.y);
+    ctx.lineTo(fighter.x + Math.cos(swordAngle) * 8, fighter.y + Math.sin(swordAngle) * 8);
+    ctx.stroke();
+
+    ctx.fillStyle = fighter.flash > 0 ? "#ffffff" : "#7f8795";
+    ctx.beginPath();
+    ctx.arc(fighter.x, fighter.y, fighter.radius, 0, TAU);
+    ctx.fill();
+
+    ctx.fillStyle = "#9ca5b3";
+    ctx.beginPath();
+    ctx.arc(fighter.x, fighter.y - 4, fighter.radius - 2, Math.PI, TAU);
+    ctx.fill();
+    ctx.fillRect(fighter.x - 8, fighter.y - 3, 16, 5);
+
+    ctx.fillStyle = "#242a34";
+    ctx.fillRect(fighter.x - 5, fighter.y - 2, 3, 3);
+    ctx.fillRect(fighter.x + 2, fighter.y - 2, 3, 3);
+
+    ctx.fillStyle = "#ffe7b3";
+    ctx.fillRect(fighter.x - 28, fighter.y - 30, 56, 5);
+    ctx.fillStyle = "#ff7676";
+    ctx.fillRect(fighter.x - 28, fighter.y - 30, 56 * (fighter.hp / fighter.maxHp), 5);
     return;
   }
 
@@ -1574,6 +2253,129 @@ function drawLightning() {
     ctx.moveTo(strike.x, 0);
     ctx.lineTo(strike.x, WORLD_HEIGHT);
     ctx.stroke();
+  }
+}
+
+function drawMeteors() {
+  for (const meteor of meteors) {
+    const pulse = 0.55 + Math.sin(elapsed * 10) * 0.18;
+    const zoneSize = meteor.radius * 2;
+
+    ctx.strokeStyle = `rgba(255, 120, 72, ${meteor.active ? 0.4 : 0.75 + pulse * 0.2})`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(meteor.x - meteor.radius, meteor.y - meteor.radius, zoneSize, zoneSize);
+
+    ctx.fillStyle = `rgba(255, 92, 54, ${meteor.active ? 0.2 : 0.12 + pulse * 0.12})`;
+    ctx.fillRect(meteor.x - meteor.radius, meteor.y - meteor.radius, zoneSize, zoneSize);
+
+    if (!meteor.active) {
+      continue;
+    }
+
+    const fallProgress = 1 - meteor.timer / meteor.fallDuration;
+    const skyOffset = (1 - fallProgress) * 58;
+    const meteorRadius = 4 + fallProgress * 6;
+    const meteorX = meteor.x;
+    const meteorY = meteor.y - skyOffset;
+
+    ctx.strokeStyle = "rgba(255, 244, 190, 0.8)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(meteorX - 10, meteorY - 10);
+    ctx.lineTo(meteorX - 2, meteorY - 2);
+    ctx.stroke();
+
+    ctx.fillStyle = "#ffb15e";
+    ctx.beginPath();
+    ctx.arc(meteorX, meteorY, meteorRadius, 0, TAU);
+    ctx.fill();
+
+    ctx.fillStyle = "#fff0bf";
+    ctx.beginPath();
+    ctx.arc(meteorX - 2, meteorY - 2, Math.max(2, meteorRadius * 0.35), 0, TAU);
+    ctx.fill();
+  }
+}
+
+function drawBossTelegraphs() {
+  const boss = getBoss();
+  if (!boss) {
+    return;
+  }
+
+  if (bossShieldActive()) {
+    ctx.strokeStyle = "rgba(255, 224, 164, 0.55)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(boss.x, boss.y, 42, 0, TAU);
+    ctx.stroke();
+    return;
+  }
+
+  if (!bossAttackType || bossAttackWindup <= 0) {
+    return;
+  }
+
+  const alpha = 0.18 + (1 - bossAttackWindup / (bossAttackType === "forward" ? 0.95 : bossAttackType === "targeted" ? 0.8 : 1.05)) * 0.24;
+  ctx.fillStyle = `rgba(255, 92, 92, ${alpha})`;
+
+  if (bossAttackType === "left") {
+    ctx.fillRect(0, 0, WORLD_WIDTH / 2, WORLD_HEIGHT);
+    return;
+  }
+
+  if (bossAttackType === "right") {
+    ctx.fillRect(WORLD_WIDTH / 2, 0, WORLD_WIDTH / 2, WORLD_HEIGHT);
+    return;
+  }
+
+  const attackRange = bossAttackType === "forward" ? 104 : 80;
+  const arc = bossAttackType === "forward" ? 0.42 : 0.52;
+  ctx.beginPath();
+  ctx.moveTo(boss.x, boss.y);
+  ctx.arc(boss.x, boss.y, attackRange, bossAttackAngle - arc, bossAttackAngle + arc);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawBossHud() {
+  const boss = getBoss();
+  if (!boss) {
+    return;
+  }
+
+  ctx.fillStyle = "rgba(12, 14, 20, 0.78)";
+  ctx.fillRect(WORLD_WIDTH / 2 - 112, 8, 224, 18);
+  ctx.fillStyle = "#ffd4d4";
+  ctx.font = "bold 9px monospace";
+  ctx.fillText("IRON HELMET", WORLD_WIDTH / 2 - 28, 16);
+  ctx.fillStyle = "#633333";
+  ctx.fillRect(WORLD_WIDTH / 2 - 100, 18, 200, 6);
+  ctx.fillStyle = "#ff6e6e";
+  ctx.fillRect(WORLD_WIDTH / 2 - 100, 18, 200 * (boss.hp / boss.maxHp), 6);
+}
+
+function drawBurningFloors() {
+  for (const floor of burningFloors) {
+    const progress = floor.timer / floor.maxTimer;
+    const zoneSize = floor.radius * 2;
+    const flicker = 0.7 + Math.sin(elapsed * 18 + floor.x * 0.1) * 0.18;
+
+    ctx.fillStyle = `rgba(255, 110, 36, ${0.24 + flicker * 0.16 * progress})`;
+    ctx.fillRect(floor.x - floor.radius, floor.y - floor.radius, zoneSize, zoneSize);
+
+    ctx.strokeStyle = `rgba(255, 214, 120, ${0.4 + progress * 0.35})`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(floor.x - floor.radius, floor.y - floor.radius, zoneSize, zoneSize);
+
+    for (let i = 0; i < 4; i += 1) {
+      const flameX = floor.x - floor.radius + 5 + i * 8;
+      const flameY = floor.y + floor.radius - 4 - ((i + Math.floor(elapsed * 10)) % 2) * 5;
+      ctx.fillStyle = `rgba(255, 188, 92, ${0.45 + progress * 0.35})`;
+      ctx.fillRect(flameX, flameY - 5, 4, 5);
+      ctx.fillStyle = `rgba(255, 82, 34, ${0.4 + progress * 0.3})`;
+      ctx.fillRect(flameX + 1, flameY - 8, 2, 3);
+    }
   }
 }
 
@@ -1747,29 +2549,69 @@ function drawHud() {
   }
 
   const unlockedWeapons = getUnlockedWeapons(player.score);
+  const minutes = Math.floor(survivalWithoutDeath / 60);
+  const seconds = Math.floor(survivalWithoutDeath % 60);
+  const progressBar = getProgressBarState();
+  const progressX = 8;
+  const progressY = 4;
+  const progressWidth = WORLD_WIDTH - 16;
+  const progressHeight = 10;
+
+  ctx.fillStyle = "rgba(10, 12, 18, 0.88)";
+  ctx.fillRect(progressX, progressY, progressWidth, progressHeight);
+  ctx.fillStyle = progressBar.fill;
+  ctx.fillRect(progressX + 1, progressY + 1, (progressWidth - 2) * progressBar.progress, progressHeight - 2);
+  ctx.strokeStyle = "rgba(255, 240, 204, 0.26)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(progressX + 0.5, progressY + 0.5, progressWidth - 1, progressHeight - 1);
+
+  const milestone15 = progressX + progressWidth * 0.25;
+  const milestone30 = progressX + progressWidth * 0.5;
+  const milestone45 = progressX + progressWidth * 0.75;
+  const milestone60 = progressX + progressWidth;
+
+  ctx.strokeStyle = "rgba(255,255,255,0.2)";
+  ctx.beginPath();
+  ctx.moveTo(milestone15, progressY + 1);
+  ctx.lineTo(milestone15, progressY + progressHeight - 1);
+  ctx.moveTo(milestone30, progressY + 1);
+  ctx.lineTo(milestone30, progressY + progressHeight - 1);
+  ctx.moveTo(milestone45, progressY + 1);
+  ctx.lineTo(milestone45, progressY + progressHeight - 1);
+  ctx.stroke();
+
+  ctx.fillStyle = "#fff1da";
+  ctx.font = "bold 7px monospace";
+  ctx.fillText(progressBar.label, progressX + 5, progressY + 8);
+  ctx.fillText("15", milestone15 - 5, progressY + 18);
+  ctx.fillText("30", milestone30 - 5, progressY + 18);
+  ctx.fillText("45", milestone45 - 5, progressY + 18);
+  ctx.fillText("60", milestone60 - 5, progressY + 18);
 
   ctx.fillStyle = "rgba(14, 16, 24, 0.72)";
-  ctx.fillRect(8, 8, 96, 54);
+  ctx.fillRect(8, 24, 126, 106);
 
   ctx.fillStyle = "#f5e7c8";
   ctx.font = "bold 8px monospace";
-  ctx.fillText(`HP ${Math.ceil(player.hp)}`, 14, 18);
-  ctx.fillText(`Score ${player.score}`, 14, 28);
-  ctx.fillText(getActivePlayerWeapon(player).toUpperCase(), 14, 38);
-  ctx.fillText(`CRIT ${Math.round(player.critChance * 100)}%`, 14, 48);
-  ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 58);
-  ctx.fillText(`MINES ${player.mineCount}`, 14, 68);
-  ctx.fillText(`SHLD ${player.shieldCount}`, 14, 78);
-  ctx.fillText(`RAGE ${Math.round(player.rageCharge)}%`, 14, 88);
+  ctx.fillText(`HP ${Math.ceil(player.hp)}`, 14, 34);
+  ctx.fillText(`Score ${player.score}`, 14, 44);
+  ctx.fillText(getActivePlayerWeapon(player).toUpperCase(), 14, 54);
+  ctx.fillText(`CRIT ${Math.round(player.critChance * 100)}%`, 14, 64);
+  ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 74);
+  ctx.fillText(`MINES ${player.mineCount}`, 14, 84);
+  ctx.fillText(`SHLD ${player.shieldCount}`, 14, 94);
+  ctx.fillText(`RAGE ${Math.round(player.rageCharge)}%`, 14, 104);
+  ctx.fillText(`TIME ${minutes}:${seconds.toString().padStart(2, "0")}`, 14, 114);
+  ctx.fillText(getPhaseLabel(), 14, 124);
 
   if (player.shieldTimer > 0) {
     ctx.fillStyle = "rgba(95, 193, 255, 0.3)";
-    ctx.fillRect(112, 8, 70, 12);
+    ctx.fillRect(142, 24, 70, 12);
     ctx.fillStyle = "#dff6ff";
-    ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, 116, 18);
+    ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, 146, 34);
   }
 
-  const rageRect = touchControls.enabled ? getMobileRageButtonRect() : { x: 112, y: 24, width: 70, height: 12 };
+  const rageRect = touchControls.enabled ? getMobileRageButtonRect() : { x: 142, y: 40, width: 70, height: 12 };
   ctx.fillStyle = "rgba(255, 110, 90, 0.22)";
   ctx.fillRect(rageRect.x, rageRect.y, rageRect.width, rageRect.height);
   ctx.fillStyle = "rgba(255, 110, 90, 0.82)";
@@ -1796,8 +2638,8 @@ function drawHud() {
         : player.rageCooldown > 0
           ? `CD ${player.rageCooldown.toFixed(1)}s`
           : "SPACE RAGE",
-      116,
-      34
+      146,
+      50
     );
   }
 
@@ -1963,8 +2805,12 @@ function render() {
   drawBullets();
   drawExplosions();
   drawLightning();
+  drawMeteors();
+  drawBurningFloors();
+  drawBossTelegraphs();
   fighters.forEach(drawFighter);
   drawHud();
+  drawBossHud();
   drawTouchControls();
   drawPauseOverlay();
 }
