@@ -10,6 +10,8 @@ body {
 body {
   display: grid;
   place-items: center;
+  background:
+    radial-gradient(circle at top, #b96b38 0%, #6b3d24 42%, #1f120d 100%);
 }
 
 canvas {
@@ -18,7 +20,7 @@ canvas {
   height: min(100vh, calc(100vw * 9 / 16));
   image-rendering: pixelated;
   image-rendering: crisp-edges;
-  background: #1b2930;
+  background: #5a341f;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;

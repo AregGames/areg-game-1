@@ -52,13 +52,14 @@ type Fighter = {
   damageMultiplier: number;
   team: "player" | "enemy" | "ally";
   helperType: "none" | "red" | "green";
-  mineCount: number;
+  headMark: "none" | "skull";
   shieldCount: number;
   shieldTimer: number;
   rageCharge: number;
   rageTimer: number;
   rageCooldown: number;
   isBoss: boolean;
+  bossKind: BossKind;
 };
 
 type Bullet = {
@@ -125,17 +126,6 @@ type StarPickup = {
   color: "blue" | "red";
 };
 
-type MinePickup = {
-  x: number;
-  y: number;
-};
-
-type PlacedMine = {
-  x: number;
-  y: number;
-  radius: number;
-};
-
 type ShieldPickup = {
   x: number;
   y: number;
@@ -149,6 +139,7 @@ type Explosion = {
   maxTimer: number;
 };
 
+type BossKind = "none" | "iron" | "skull";
 type BossAttackType = "targeted" | "forward" | "left" | "right";
 
 const input = {
@@ -194,9 +185,6 @@ let medkitCooldown = 4.5;
 const medkits: Medkit[] = [];
 let starCooldown = 8;
 const stars: StarPickup[] = [];
-let minePickupCooldown = 9;
-const minePickups: MinePickup[] = [];
-const placedMines: PlacedMine[] = [];
 let shieldPickupCooldown = 18;
 const shieldPickups: ShieldPickup[] = [];
 const explosions: Explosion[] = [];
@@ -209,6 +197,7 @@ let rulesScroll = 0;
 let rulesTouchY: number | null = null;
 let mobileFullscreenAttempted = false;
 let pendingRunReset = false;
+let devInfiniteHealth = false;
 let survivalWithoutDeath = 0;
 let bossFightStarted = false;
 let bossFightWon = false;
@@ -221,6 +210,11 @@ let bossAttackIndex = 0;
 let bossAttackAngle = 0;
 let bossAttackHitApplied = false;
 let bossSpinDamageTick = 0;
+let bossSwordContactTick = 0;
+let skullBossActionTimer = 0;
+let skullBossActionIndex = 0;
+let skullBossBurstShotsLeft = 0;
+let skullBossBurstWindup = 0;
 let bossesDefeated = 0;
 
 const bossAttackPattern: BossAttackType[] = ["targeted", "targeted", "forward", "left", "right", "left", "left"];
@@ -230,6 +224,16 @@ const palette = [
   ["#ff8a5b", "#ffe0c4"],
   ["#ff5f8c", "#ffd6e4"],
   ["#96e072", "#edffd9"]
+];
+
+const devStageSnapshots = [
+  { survival: 0, bossesDefeated: 0, boss: "none" as BossKind },
+  { survival: 30, bossesDefeated: 0, boss: "none" as BossKind },
+  { survival: 59, bossesDefeated: 0, boss: "none" as BossKind },
+  { survival: 60, bossesDefeated: 0, boss: "iron" as BossKind },
+  { survival: 75, bossesDefeated: 1, boss: "none" as BossKind },
+  { survival: 120, bossesDefeated: 1, boss: "skull" as BossKind },
+  { survival: 130, bossesDefeated: 2, boss: "none" as BossKind }
 ];
 
 const rulesLines = [
@@ -246,6 +250,8 @@ const rulesLines = [
   "METEORS FALL INTO A 2X2 BLAST ZONE. KEEP MOVING.",
   "AFTER 60s WITHOUT DYING, METEORS LEAVE BURNING GROUND.",
   "AT 60s A SHIELDED BOSS TAKES OVER THE ARENA.",
+  "AT 120s THE SKULL LORD ARRIVES WITH MINIONS AND HAZARDS.",
+  "PRESS E TO USE A STORED SHIELD CHARGE.",
   "P OR ESC PAUSES AND RESUMES.",
   "CLICK BACK TO RETURN TO THE PAUSE MENU.",
   "USE MOUSE WHEEL TO SCROLL THESE RULES."
@@ -282,13 +288,14 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     damageMultiplier: 1,
     team: isPlayer ? "player" : "enemy",
     helperType: "none",
-    mineCount: 0,
+    headMark: "none",
     shieldCount: 0,
     shieldTimer: 0,
     rageCharge: isPlayer ? 100 : 0,
     rageTimer: 0,
     rageCooldown: 0,
-    isBoss: false
+    isBoss: false,
+    bossKind: "none"
   };
 }
 
@@ -307,11 +314,15 @@ function getWaveEnemyCount() {
 }
 
 function getPhaseLabel() {
-  if (bossFightStarted) {
-    return "BOSS PHASE";
+  const boss = getBoss();
+  if (bossFightStarted && boss) {
+    return boss.bossKind === "skull" ? "SKULL PHASE" : "IRON PHASE";
+  }
+  if (bossesDefeated >= 2) {
+    return "FINAL SURGE";
   }
   if (bossesDefeated >= 1) {
-    return "POST-BOSS SURGE";
+    return survivalWithoutDeath >= 120 ? "SKULL OMEN" : "POST-BOSS SURGE";
   }
   if (survivalWithoutDeath >= 60) {
     return "FIREFALL";
@@ -323,18 +334,27 @@ function getPhaseLabel() {
 }
 
 function getProgressBarState() {
-  if (bossFightStarted) {
+  const boss = getBoss();
+  if (bossFightStarted && boss) {
     return {
       progress: 1,
-      label: "BOSS ACTIVE",
-      fill: "#ff8d6b"
+      label: boss.bossKind === "skull" ? "SKULL ACTIVE" : "IRON ACTIVE",
+      fill: boss.bossKind === "skull" ? "#ffd16f" : "#ff8d6b"
+    };
+  }
+
+  if (bossesDefeated >= 2) {
+    return {
+      progress: 1,
+      label: "BOSS CLEARED",
+      fill: "#9be38d"
     };
   }
 
   if (bossesDefeated >= 1) {
     return {
-      progress: Math.min(1, survivalWithoutDeath / 60),
-      label: "NEXT BOSS",
+      progress: Math.min(1, survivalWithoutDeath / 120),
+      label: "SKULL INCOMING",
       fill: "#ffcf6b"
     };
   }
@@ -389,15 +409,12 @@ function spawnRoster() {
   burningFloors.length = 0;
   medkits.length = 0;
   stars.length = 0;
-  minePickups.length = 0;
-  placedMines.length = 0;
   shieldPickups.length = 0;
   explosions.length = 0;
   lightningCooldown = 2.4;
   meteorCooldown = 5.2;
   medkitCooldown = 4.5;
   starCooldown = 8;
-  minePickupCooldown = 9;
   shieldPickupCooldown = 18;
   selectedWeapon = "pistol";
   highestUnlockedWeapon = "pistol";
@@ -414,6 +431,11 @@ function spawnRoster() {
   bossAttackAngle = 0;
   bossAttackHitApplied = false;
   bossSpinDamageTick = 0;
+  bossSwordContactTick = 0;
+  skullBossActionTimer = 0;
+  skullBossActionIndex = 0;
+  skullBossBurstShotsLeft = 0;
+  skullBossBurstWindup = 0;
   bossesDefeated = 0;
   const playerSpawn = getRandomSpawnPoint(7);
   fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
@@ -457,13 +479,133 @@ function clearAmbientHazards() {
   burningFloors.length = 0;
   medkits.length = 0;
   stars.length = 0;
-  minePickups.length = 0;
-  placedMines.length = 0;
   shieldPickups.length = 0;
   explosions.length = 0;
 }
 
-function startBossFight() {
+function playerHasInfiniteHealth(target: Fighter) {
+  return devInfiniteHealth && target.team === "player";
+}
+
+function ensureEnemyWavePresent() {
+  const activeEnemies = fighters.some((fighter) => fighter.team === "enemy" && fighter.respawn <= 0);
+  if (!activeEnemies && !bossFightStarted) {
+    spawnEnemyWave();
+  }
+}
+
+function applyDevStage(stageIndex: number) {
+  const snapshot = devStageSnapshots[clamp(stageIndex, 0, devStageSnapshots.length - 1)];
+  const player = fighters.find((fighter) => fighter.team === "player") ?? null;
+
+  clearAmbientHazards();
+  despawnEnemies();
+  survivalWithoutDeath = snapshot.survival;
+  bossesDefeated = snapshot.bossesDefeated;
+  bossFightStarted = false;
+  bossFightWon = false;
+  bossIntroTimer = 0;
+  bossAttackType = null;
+  bossAttackWindup = 0;
+  bossAttackActive = 0;
+  bossAttackRecover = 0;
+  bossAttackIndex = 0;
+  bossAttackAngle = 0;
+  bossAttackHitApplied = false;
+  bossSpinDamageTick = 0;
+  bossSwordContactTick = 0;
+  skullBossActionTimer = 0;
+  skullBossActionIndex = 0;
+  pendingRunReset = false;
+
+  for (let i = fighters.length - 1; i >= 0; i -= 1) {
+    if (fighters[i].team === "ally") {
+      fighters.splice(i, 1);
+    }
+  }
+
+  if (player) {
+    player.respawn = 0;
+    player.hp = player.maxHp;
+    player.shieldTimer = 0;
+    player.rageTimer = 0;
+    player.rageCooldown = 0;
+    player.rageCharge = 100;
+    player.x = WORLD_WIDTH / 2;
+    player.y = WORLD_HEIGHT / 2 + 58;
+    player.vx = 0;
+    player.vy = 0;
+  }
+
+  if (snapshot.boss === "iron" || snapshot.boss === "skull") {
+    startBossFight(snapshot.boss);
+  } else {
+    ensureEnemyWavePresent();
+  }
+}
+
+function getCurrentDevStageIndex() {
+  const boss = getBoss();
+  if (bossFightStarted && boss?.bossKind === "skull") {
+    return 5;
+  }
+  if (bossFightStarted && boss?.bossKind === "iron") {
+    return 3;
+  }
+  if (bossesDefeated >= 2) {
+    return 6;
+  }
+  if (bossesDefeated >= 1) {
+    return 4;
+  }
+  if (survivalWithoutDeath >= 59) {
+    return 2;
+  }
+  if (survivalWithoutDeath >= 30) {
+    return 1;
+  }
+  return 0;
+}
+
+function stepDevStage(direction: -1 | 1) {
+  const nextStage = clamp(getCurrentDevStageIndex() + direction, 0, devStageSnapshots.length - 1);
+  applyDevStage(nextStage);
+}
+
+function configureIronBoss(boss: Fighter) {
+  boss.isBoss = true;
+  boss.bossKind = "iron";
+  boss.team = "enemy";
+  boss.archetype = "melee";
+  boss.radius = 18;
+  boss.speed = 0;
+  boss.hp = 3750;
+  boss.maxHp = 3750;
+  boss.color = "#6d7686";
+  boss.accent = "#cfd7df";
+  boss.dir = -Math.PI / 2;
+  boss.flash = 0;
+  boss.attackCooldown = 0;
+}
+
+function configureSkullBoss(boss: Fighter) {
+  boss.isBoss = true;
+  boss.bossKind = "skull";
+  boss.team = "enemy";
+  boss.archetype = "ranged";
+  boss.radius = 20;
+  boss.speed = 0;
+  boss.hp = 2200;
+  boss.maxHp = 2200;
+  boss.color = "#5b5d68";
+  boss.accent = "#ece6d8";
+  boss.headMark = "skull";
+  boss.dir = -Math.PI / 2;
+  boss.flash = 0;
+  boss.attackCooldown = 0;
+}
+
+function startBossFight(kind: BossKind) {
   if (bossFightStarted || bossFightWon) {
     return;
   }
@@ -480,22 +622,15 @@ function startBossFight() {
   }
 
   const boss = createFighter(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, false, 1);
-  boss.isBoss = true;
-  boss.team = "enemy";
-  boss.archetype = "melee";
-  boss.radius = 18;
-  boss.speed = 0;
-  boss.hp = 1500;
-  boss.maxHp = 1500;
-  boss.color = "#6d7686";
-  boss.accent = "#cfd7df";
-  boss.dir = -Math.PI / 2;
-  boss.flash = 0;
-  boss.attackCooldown = 0;
+  if (kind === "skull") {
+    configureSkullBoss(boss);
+  } else {
+    configureIronBoss(boss);
+  }
   fighters.push(boss);
 
   bossFightStarted = true;
-  bossIntroTimer = 5.5;
+  bossIntroTimer = kind === "iron" ? 5.5 : 0;
   bossAttackType = null;
   bossAttackWindup = 0;
   bossAttackActive = 0;
@@ -503,7 +638,12 @@ function startBossFight() {
   bossAttackIndex = 0;
   bossAttackAngle = boss.dir;
   bossAttackHitApplied = false;
-  bossSpinDamageTick = 0.28;
+  bossSpinDamageTick = kind === "iron" ? 0.28 : 0;
+  bossSwordContactTick = kind === "iron" ? 0.18 : 0;
+  skullBossActionTimer = kind === "skull" ? 1.25 : 0;
+  skullBossActionIndex = 0;
+  skullBossBurstShotsLeft = 0;
+  skullBossBurstWindup = 0;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -614,7 +754,6 @@ function respawn(fighter: Fighter) {
     fighter.critChance = 0.02;
     fighter.damageMultiplier = 1;
     fighter.score = 0;
-    fighter.mineCount = 0;
     fighter.shieldCount = 0;
     fighter.shieldTimer = 0;
     fighter.rageCharge = 100;
@@ -720,10 +859,6 @@ function playHelperSound(color: "red" | "green") {
   }
 }
 
-function playMineSound() {
-  playTone("square", 260, 0.12, 0.04, 120);
-}
-
 function playShieldSound() {
   playTone("triangle", 320, 0.14, 0.035, 640);
 }
@@ -804,20 +939,6 @@ function createHelper(type: "red" | "green", player: Fighter) {
   helper.critChance = 0;
   fighters.push(helper);
   playHelperSound(type);
-}
-
-function placeMine(player: Fighter) {
-  if (player.mineCount <= 0) {
-    return;
-  }
-
-  placedMines.push({
-    x: player.x,
-    y: player.y,
-    radius: 22
-  });
-  player.mineCount -= 1;
-  playMineSound();
 }
 
 function activateShield(player: Fighter) {
@@ -971,7 +1092,7 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      const damage = enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 10;
+      const damage = playerHasInfiniteHealth(enemy) ? 0 : enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 10;
       enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
@@ -1114,7 +1235,8 @@ function distanceToSegment(
 }
 
 function bossShieldActive() {
-  return bossFightStarted && bossIntroTimer > 0;
+  const boss = getBoss();
+  return bossFightStarted && bossIntroTimer > 0 && boss?.bossKind === "iron";
 }
 
 function queueBossAttack(boss: Fighter, player: Fighter | null) {
@@ -1163,7 +1285,165 @@ function applyBossAttack(boss: Fighter) {
   }
 }
 
+function damageTargetsTouchingBossSword(boss: Fighter, damage: number, knockback: number) {
+  const swordLength = getBossArenaRadius() - 4;
+  const swordStartX = boss.x + Math.cos(boss.dir) * (boss.radius - 2);
+  const swordStartY = boss.y + Math.sin(boss.dir) * (boss.radius - 2);
+  const swordEndX = boss.x + Math.cos(boss.dir) * swordLength;
+  const swordEndY = boss.y + Math.sin(boss.dir) * swordLength;
+
+  for (const target of getBossTargets()) {
+    const distanceFromBlade = distanceToSegment(
+      target.x,
+      target.y,
+      swordStartX,
+      swordStartY,
+      swordEndX,
+      swordEndY
+    );
+
+    if (distanceFromBlade <= target.radius + 4) {
+      damageHazardTarget(target, damage, boss.x, boss.y, knockback);
+    }
+  }
+}
+
+function spawnSkullBossProjectile(boss: Fighter, target: Fighter | null) {
+  const angle = target ? Math.atan2(target.y - boss.y, target.x - boss.x) : boss.dir;
+  const arenaRadius = getBossArenaRadius() - 6;
+  const speed = 72;
+  bullets.push({
+    x: boss.x + Math.cos(angle) * (boss.radius + 6),
+    y: boss.y + Math.sin(angle) * (boss.radius + 6),
+    vx: Math.cos(angle) * speed,
+    vy: Math.sin(angle) * speed,
+    ownerId: boss.id,
+    life: arenaRadius / speed + 0.35,
+    color: "#f0e7d4",
+    damage: 28,
+    size: 6,
+    weapon: "pistol",
+    isCrit: false,
+    healAmount: 0
+  });
+  playShootSound(false);
+}
+
+function spawnSkullMinions(count: number) {
+  const reservedSpawns = fighters
+    .filter((fighter) => fighter.respawn <= 0)
+    .map((fighter) => ({ x: fighter.x, y: fighter.y, radius: fighter.radius }));
+
+  for (let index = 0; index < count; index += 1) {
+    const minion = createFighter(0, 0, false, 1 + (index % 3));
+    minion.team = "enemy";
+    minion.archetype = "melee";
+    minion.headMark = "skull";
+    minion.radius = 8;
+    minion.speed = 60;
+    minion.maxHp = 135;
+    minion.hp = 135;
+    minion.damageMultiplier = 1.15;
+    minion.color = "#4c4e57";
+    minion.accent = "#d8d1c2";
+    const spawn = getRandomSpawnPoint(minion.radius, undefined, reservedSpawns);
+    minion.x = spawn.x;
+    minion.y = spawn.y;
+    minion.spawnX = spawn.x;
+    minion.spawnY = spawn.y;
+    reservedSpawns.push({ x: spawn.x, y: spawn.y, radius: minion.radius });
+    fighters.push(minion);
+  }
+}
+
+function spawnBossLightningAt(x: number) {
+  lightningStrikes.push({
+    x,
+    timer: 0.65,
+    duration: 0.22,
+    warning: 0.65,
+    active: false,
+    hitApplied: false
+  });
+}
+
+function spawnBossMeteorAt(x: number, y: number) {
+  meteors.push({
+    x,
+    y,
+    timer: 0.85,
+    warning: 0.85,
+    fallDuration: 0.34,
+    active: false,
+    hitApplied: false,
+    radius: 16
+  });
+}
+
+function summonSkullBossHazards() {
+  for (let index = 0; index < 3; index += 1) {
+    const strikePoint = getRandomSpawnPoint(14);
+    spawnBossLightningAt(strikePoint.x);
+  }
+
+  for (let index = 0; index < 3; index += 1) {
+    const meteorPoint = getRandomSpawnPoint(16);
+    spawnBossMeteorAt(meteorPoint.x, meteorPoint.y);
+  }
+}
+
+function updateSkullBoss(boss: Fighter, dt: number) {
+  boss.vx = 0;
+  boss.vy = 0;
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
+  if (player) {
+    boss.dir = Math.atan2(player.y - boss.y, player.x - boss.x);
+  }
+
+  if (skullBossBurstShotsLeft > 0) {
+    skullBossBurstWindup = Math.max(0, skullBossBurstWindup - dt);
+    while (skullBossBurstShotsLeft > 0 && skullBossBurstWindup <= 0) {
+      spawnSkullBossProjectile(boss, player);
+      skullBossBurstShotsLeft -= 1;
+      if (skullBossBurstShotsLeft > 0) {
+        skullBossBurstWindup += 0.025;
+      }
+    }
+
+    if (skullBossBurstShotsLeft > 0) {
+      return;
+    }
+
+    skullBossActionTimer = 1.1;
+  }
+
+  skullBossActionTimer = Math.max(0, skullBossActionTimer - dt);
+  if (skullBossActionTimer > 0) {
+    return;
+  }
+
+  const action = skullBossActionIndex % 3;
+  if (action === 0) {
+    skullBossBurstShotsLeft = 20;
+    skullBossBurstWindup = 0.025;
+    skullBossActionTimer = 0;
+  } else if (action === 1) {
+    spawnSkullMinions(5);
+    skullBossActionTimer = 3;
+  } else {
+    summonSkullBossHazards();
+    skullBossActionTimer = 3.6;
+  }
+
+  skullBossActionIndex += 1;
+}
+
 function updateBoss(boss: Fighter, dt: number) {
+  if (boss.bossKind === "skull") {
+    updateSkullBoss(boss, dt);
+    return;
+  }
+
   boss.vx = 0;
   boss.vy = 0;
   const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
@@ -1177,25 +1457,7 @@ function updateBoss(boss: Fighter, dt: number) {
     bossSpinDamageTick -= dt;
 
     if (bossSpinDamageTick <= 0) {
-      const swordLength = getBossArenaRadius() - 4;
-      const swordStartX = boss.x + Math.cos(boss.dir) * (boss.radius - 2);
-      const swordStartY = boss.y + Math.sin(boss.dir) * (boss.radius - 2);
-      const swordEndX = boss.x + Math.cos(boss.dir) * swordLength;
-      const swordEndY = boss.y + Math.sin(boss.dir) * swordLength;
-
-      for (const target of getBossTargets()) {
-        const distanceFromBlade = distanceToSegment(
-          target.x,
-          target.y,
-          swordStartX,
-          swordStartY,
-          swordEndX,
-          swordEndY
-        );
-        if (distanceFromBlade <= target.radius + 4) {
-          damageHazardTarget(target, 12, boss.x, boss.y, 0);
-        }
-      }
+      damageTargetsTouchingBossSword(boss, 12, 0);
       bossSpinDamageTick = 0.28;
     }
 
@@ -1203,6 +1465,12 @@ function updateBoss(boss: Fighter, dt: number) {
       queueBossAttack(boss, player);
     }
     return;
+  }
+
+  bossSwordContactTick = Math.max(0, bossSwordContactTick - dt);
+  if (bossSwordContactTick <= 0) {
+    damageTargetsTouchingBossSword(boss, 10, 8);
+    bossSwordContactTick = 0.18;
   }
 
   if (!bossAttackType) {
@@ -1269,6 +1537,10 @@ function moveFighter(fighter: Fighter, dt: number) {
 }
 
 function applyKnockback(target: Fighter, sourceX: number, sourceY: number, strength: number) {
+  if (target.isBoss) {
+    return;
+  }
+
   const dx = target.x - sourceX;
   const dy = target.y - sourceY;
   const length = Math.hypot(dx, dy) || 1;
@@ -1311,8 +1583,6 @@ function clearRunStateOnPlayerDeath() {
   burningFloors.length = 0;
   medkits.length = 0;
   stars.length = 0;
-  minePickups.length = 0;
-  placedMines.length = 0;
   shieldPickups.length = 0;
   explosions.length = 0;
   survivalWithoutDeath = 0;
@@ -1327,6 +1597,11 @@ function clearRunStateOnPlayerDeath() {
   bossAttackAngle = 0;
   bossAttackHitApplied = false;
   bossSpinDamageTick = 0;
+  bossSwordContactTick = 0;
+  skullBossActionTimer = 0;
+  skullBossActionIndex = 0;
+  skullBossBurstShotsLeft = 0;
+  skullBossBurstWindup = 0;
   bossesDefeated = 0;
 
   for (let i = fighters.length - 1; i >= 0; i -= 1) {
@@ -1347,6 +1622,7 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
   }
 
   if (target.isBoss) {
+    const defeatedBossKind = target.bossKind;
     const index = fighters.findIndex((fighter) => fighter.id === target.id);
     if (index >= 0) {
       fighters.splice(index, 1);
@@ -1359,12 +1635,16 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
     bossAttackActive = 0;
     bossAttackRecover = 0;
     bossAttackHitApplied = false;
+    bossSwordContactTick = 0;
+    skullBossActionTimer = 0;
+    skullBossActionIndex = 0;
+    skullBossBurstShotsLeft = 0;
+    skullBossBurstWindup = 0;
     bossesDefeated += 1;
-    survivalWithoutDeath = 0;
     clearAmbientHazards();
     spawnEnemyWave();
     if (owner) {
-      owner.score += 10;
+      owner.score += defeatedBossKind === "skull" ? 14 : 10;
     }
     playDefeatSound();
     return;
@@ -1416,6 +1696,33 @@ function canHitTarget(owner: Fighter | null, target: Fighter) {
   return target.team === "enemy";
 }
 
+function applyProjectileDamage(
+  target: Fighter,
+  damage: number,
+  sourceX: number,
+  sourceY: number,
+  knockback: number,
+  owner: Fighter | null
+) {
+  const appliedDamage = playerHasInfiniteHealth(target)
+    ? 0
+    : target.rageTimer > 0
+      ? 0
+      : target.shieldTimer > 0
+        ? 0
+        : damage;
+
+  target.hp -= appliedDamage;
+  target.flash = 0.18;
+  if (knockback > 0) {
+    applyKnockback(target, sourceX, sourceY, knockback);
+  }
+
+  if (target.hp <= 0) {
+    defeatFighter(target, owner);
+  }
+}
+
 function explodeBazooka(bullet: Bullet) {
   const owner = fighters.find((fighter) => fighter.id === bullet.ownerId) ?? null;
   addExplosion(bullet.x, bullet.y, 30);
@@ -1436,44 +1743,8 @@ function explodeBazooka(bullet: Bullet) {
 
     const falloff = 1 - distance / 30;
     const damage = Math.max(40, Math.round(bullet.damage * falloff));
-    fighter.hp -= damage;
-    fighter.flash = 0.18;
-    applyKnockback(fighter, bullet.x, bullet.y, 14 * falloff);
-
-    if (fighter.hp <= 0) {
-      defeatFighter(fighter, owner);
-    }
+    applyProjectileDamage(fighter, damage, bullet.x, bullet.y, 14 * falloff, owner);
   }
-}
-
-function detonateMine(index: number) {
-  const mine = placedMines[index];
-  addExplosion(mine.x, mine.y, mine.radius);
-  playHitSound(false);
-
-  for (const fighter of fighters) {
-    if (fighter.team !== "enemy" || fighter.respawn > 0) {
-      continue;
-    }
-
-    const distance = Math.hypot(fighter.x - mine.x, fighter.y - mine.y);
-    if (distance > mine.radius) {
-      continue;
-    }
-
-    const falloff = 1 - distance / mine.radius;
-    const damage = Math.max(48, Math.round(96 * falloff));
-    fighter.hp -= damage;
-    fighter.flash = 0.18;
-    applyKnockback(fighter, mine.x, mine.y, 20 * falloff);
-
-    if (fighter.hp <= 0) {
-      const player = fighters.find((fighter) => fighter.team === "player") ?? null;
-      defeatFighter(fighter, player);
-    }
-  }
-
-  placedMines.splice(index, 1);
 }
 
 function updateBullets(dt: number) {
@@ -1579,9 +1850,8 @@ function updateBullets(dt: number) {
       continue;
     }
 
-    const damage = target.rageTimer > 0 ? 0 : target.shieldTimer > 0 ? 0 : bullet.damage;
-    target.hp -= damage;
-    target.flash = 0.14;
+    const directHitKnockback = target.rageTimer > 0 && target.team === "player" ? 0 : bullet.isCrit ? 8 : 0;
+    applyProjectileDamage(target, bullet.damage, bullet.x, bullet.y, directHitKnockback, owner);
     bullet.life = 0;
     playHitSound(false);
 
@@ -1597,12 +1867,8 @@ function updateBullets(dt: number) {
       continue;
     }
 
-    if (bullet.isCrit) {
-      applyKnockback(target, bullet.x, bullet.y, 8);
-    }
-
     if (target.hp <= 0) {
-      defeatFighter(target, owner);
+      continue;
     }
   }
 
@@ -1648,17 +1914,6 @@ function spawnStar() {
   });
 }
 
-function spawnMinePickup() {
-  if (minePickups.length >= 1) {
-    return;
-  }
-
-  minePickups.push({
-    x: 28 + Math.random() * (WORLD_WIDTH - 56),
-    y: 28 + Math.random() * (WORLD_HEIGHT - 56)
-  });
-}
-
 function spawnShieldPickup() {
   if (shieldPickups.length >= 1) {
     return;
@@ -1688,28 +1943,6 @@ function updateMedkits(dt: number) {
       player.hp = Math.min(player.maxHp, player.hp + 32);
       medkits.splice(i, 1);
       playPickupSound();
-    }
-  }
-}
-
-function updateMinePickups(dt: number) {
-  minePickupCooldown -= dt;
-  if (minePickupCooldown <= 0) {
-    spawnMinePickup();
-    minePickupCooldown = 12 + Math.random() * 8;
-  }
-
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
-  if (!player) {
-    return;
-  }
-
-  for (let i = minePickups.length - 1; i >= 0; i -= 1) {
-    const minePickup = minePickups[i];
-    if (Math.hypot(player.x - minePickup.x, player.y - minePickup.y) < player.radius + 7) {
-      player.mineCount += 1;
-      minePickups.splice(i, 1);
-      playMineSound();
     }
   }
 }
@@ -1772,22 +2005,6 @@ function updateStars(dt: number) {
   }
 }
 
-function updatePlacedMines() {
-  for (let i = placedMines.length - 1; i >= 0; i -= 1) {
-    const mine = placedMines[i];
-    const triggered = fighters.find(
-      (fighter) =>
-        fighter.team === "enemy" &&
-        fighter.respawn <= 0 &&
-        Math.hypot(fighter.x - mine.x, fighter.y - mine.y) < fighter.radius + 6
-    );
-
-    if (triggered) {
-      detonateMine(i);
-    }
-  }
-}
-
 function spawnLightningStrike() {
   lightningStrikes.push({
     x: 28 + Math.random() * (WORLD_WIDTH - 56),
@@ -1799,13 +2016,15 @@ function spawnLightningStrike() {
   });
 }
 
-function updateLightning(dt: number) {
+function updateLightning(dt: number, allowAutoSpawn = true) {
   const lightningSettings = getLightningSettings();
   lightningCooldown -= dt;
-  if (lightningCooldown <= 0) {
+  if (allowAutoSpawn && lightningCooldown <= 0) {
     spawnLightningStrike();
     lightningCooldown =
       lightningSettings.minCooldown + Math.random() * (lightningSettings.maxCooldown - lightningSettings.minCooldown);
+  } else if (!allowAutoSpawn && lightningCooldown < 0) {
+    lightningCooldown = 0;
   }
 
   const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
@@ -1822,20 +2041,22 @@ function updateLightning(dt: number) {
     if (strike.active && !strike.hitApplied && player) {
       const distanceFromLine = Math.abs(player.x - strike.x);
       if (distanceFromLine < 14) {
-        player.hp -= lightningSettings.damage;
-        if (player.rageTimer > 0) {
-          player.hp += lightningSettings.damage;
-          player.hp -= Math.round(lightningSettings.damage * 0.8);
-        }
-        player.flash = 0.22;
-        playHitSound(false);
+        if (!playerHasInfiniteHealth(player)) {
+          player.hp -= lightningSettings.damage;
+          if (player.rageTimer > 0) {
+            player.hp += lightningSettings.damage;
+            player.hp -= Math.round(lightningSettings.damage * 0.8);
+          }
+          player.flash = 0.22;
+          playHitSound(false);
 
-        if (player.hp <= 0) {
-          player.hp = 0;
-          player.respawn = 2.2;
-          clearRunStateOnPlayerDeath();
-          pendingRunReset = true;
-          playDefeatSound();
+          if (player.hp <= 0) {
+            player.hp = 0;
+            player.respawn = 2.2;
+            clearRunStateOnPlayerDeath();
+            pendingRunReset = true;
+            playDefeatSound();
+          }
         }
       }
       strike.hitApplied = true;
@@ -1874,6 +2095,10 @@ function spawnBurningFloor(x: number, y: number, radius: number) {
 }
 
 function damageHazardTarget(target: Fighter, damage: number, sourceX: number, sourceY: number, knockback: number) {
+  if (playerHasInfiniteHealth(target)) {
+    target.hp = target.maxHp;
+    return;
+  }
   const appliedDamage = target.rageTimer > 0 ? Math.max(0, Math.round(damage * 0.28)) : target.shieldTimer > 0 ? 0 : damage;
   target.hp -= appliedDamage;
   target.flash = 0.2;
@@ -1918,13 +2143,15 @@ function updateBurningFloors(dt: number) {
   }
 }
 
-function updateMeteors(dt: number) {
+function updateMeteors(dt: number, allowAutoSpawn = true) {
   const meteorSettings = getMeteorSettings();
   meteorCooldown -= dt;
-  if (meteorCooldown <= 0) {
+  if (allowAutoSpawn && meteorCooldown <= 0) {
     spawnMeteor();
     meteorCooldown =
       meteorSettings.minCooldown + Math.random() * (meteorSettings.maxCooldown - meteorSettings.minCooldown);
+  } else if (!allowAutoSpawn && meteorCooldown < 0) {
+    meteorCooldown = 0;
   }
 
   const hazardTargets = fighters.filter(
@@ -1974,8 +2201,12 @@ function update(dt: number) {
     survivalWithoutDeath += dt;
   }
 
-  if (player && survivalWithoutDeath >= 60 && !bossFightStarted && !bossFightWon) {
-    startBossFight();
+  if (player && !bossFightStarted && !bossFightWon) {
+    if (bossesDefeated === 0 && survivalWithoutDeath >= 60) {
+      startBossFight("iron");
+    } else if (bossesDefeated === 1 && survivalWithoutDeath >= 120) {
+      startBossFight("skull");
+    }
   }
 
   for (const fighter of fighters) {
@@ -1989,6 +2220,9 @@ function update(dt: number) {
     }
     if (fighter.team === "player" && fighter.rageTimer <= 0 && fighter.rageCooldown <= 0) {
       fighter.rageCharge = Math.min(100, fighter.rageCharge + dt * 8);
+    }
+    if (playerHasInfiniteHealth(fighter) && fighter.respawn <= 0) {
+      fighter.hp = fighter.maxHp;
     }
 
     if (fighter.respawn > 0) {
@@ -2016,15 +2250,18 @@ function update(dt: number) {
 
   updateBullets(dt);
   updateExplosions(dt);
+  const activeBoss = getBoss();
   if (!bossFightStarted) {
     updateLightning(dt);
     updateMeteors(dt);
     updateBurningFloors(dt);
     updateMedkits(dt);
-    updateMinePickups(dt);
     updateShieldPickups(dt);
-    updatePlacedMines();
     updateStars(dt);
+  } else if (activeBoss?.bossKind === "skull") {
+    updateLightning(dt, false);
+    updateMeteors(dt, false);
+    updateBurningFloors(dt);
   }
 
   if (shouldResetRoster) {
@@ -2033,22 +2270,52 @@ function update(dt: number) {
 }
 
 function drawArena() {
-  ctx.fillStyle = "#203840";
+  const skyGradient = ctx.createLinearGradient(0, 0, 0, WORLD_HEIGHT);
+  skyGradient.addColorStop(0, "#6b3d24");
+  skyGradient.addColorStop(0.5, "#8d5630");
+  skyGradient.addColorStop(1, "#4a2818");
+  ctx.fillStyle = skyGradient;
   ctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
 
-  for (let y = 0; y < WORLD_HEIGHT; y += 16) {
-    for (let x = 0; x < WORLD_WIDTH; x += 16) {
-      ctx.fillStyle = (x + y) % 32 === 0 ? "#2d4d53" : "#345b5f";
-      ctx.fillRect(x, y, 16, 16);
-    }
+  const craters = [
+    { x: 56, y: 48, r: 18 },
+    { x: 136, y: 150, r: 24 },
+    { x: 248, y: 74, r: 15 },
+    { x: 332, y: 168, r: 22 },
+    { x: 410, y: 56, r: 16 },
+    { x: 390, y: 214, r: 26 }
+  ];
+
+  for (const crater of craters) {
+    ctx.fillStyle = "rgba(116, 58, 29, 0.32)";
+    ctx.beginPath();
+    ctx.arc(crater.x, crater.y, crater.r, 0, TAU);
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(255, 198, 136, 0.18)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(crater.x - 2, crater.y - 2, crater.r - 4, 0, TAU);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(255, 220, 170, 0.08)";
+    ctx.beginPath();
+    ctx.arc(crater.x - crater.r * 0.25, crater.y - crater.r * 0.28, crater.r * 0.35, 0, TAU);
+    ctx.fill();
+  }
+
+  for (let band = 0; band < 4; band += 1) {
+    const y = 22 + band * 58;
+    ctx.fillStyle = "rgba(255, 176, 98, 0.06)";
+    ctx.fillRect(0, y, WORLD_WIDTH, 10);
   }
 
   for (const wall of walls) {
-    ctx.fillStyle = "#9e6a3f";
+    ctx.fillStyle = "#8f5a34";
     ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
-    ctx.fillStyle = "#c99459";
+    ctx.fillStyle = "#d79a5b";
     ctx.fillRect(wall.x, wall.y, wall.w, 4);
-    ctx.fillStyle = "#734929";
+    ctx.fillStyle = "#60361d";
     ctx.fillRect(wall.x, wall.y + wall.h - 3, wall.w, 3);
   }
 
@@ -2071,12 +2338,56 @@ function drawArena() {
   }
 }
 
+function drawSkullMark(centerX: number, centerY: number, scale: number) {
+  ctx.fillStyle = "#efe6d7";
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, scale, 0, TAU);
+  ctx.fill();
+
+  ctx.fillStyle = "#1f2026";
+  ctx.fillRect(centerX - scale * 0.65, centerY - scale * 0.35, scale * 0.45, scale * 0.45);
+  ctx.fillRect(centerX + scale * 0.2, centerY - scale * 0.35, scale * 0.45, scale * 0.45);
+  ctx.fillRect(centerX - scale * 0.15, centerY, scale * 0.3, scale * 0.35);
+
+  ctx.fillStyle = "#d8cfbe";
+  ctx.fillRect(centerX - scale * 0.62, centerY + scale * 0.45, scale * 1.24, scale * 0.42);
+  ctx.fillStyle = "#2a2b31";
+  ctx.fillRect(centerX - scale * 0.42, centerY + scale * 0.48, scale * 0.18, scale * 0.34);
+  ctx.fillRect(centerX - scale * 0.1, centerY + scale * 0.48, scale * 0.18, scale * 0.34);
+  ctx.fillRect(centerX + scale * 0.22, centerY + scale * 0.48, scale * 0.18, scale * 0.34);
+}
+
 function drawFighter(fighter: Fighter) {
   if (fighter.respawn > 0) {
     return;
   }
 
   if (fighter.isBoss) {
+    if (fighter.bossKind === "skull") {
+      ctx.fillStyle = "rgba(0, 0, 0, 0.32)";
+      ctx.beginPath();
+      ctx.ellipse(fighter.x, fighter.y + 10, fighter.radius + 10, fighter.radius - 1, 0, 0, TAU);
+      ctx.fill();
+
+      ctx.fillStyle = fighter.flash > 0 ? "#ffffff" : "#595c68";
+      ctx.beginPath();
+      ctx.arc(fighter.x, fighter.y, fighter.radius, 0, TAU);
+      ctx.fill();
+
+      ctx.fillStyle = "#474954";
+      ctx.beginPath();
+      ctx.arc(fighter.x, fighter.y + 4, fighter.radius - 3, 0, TAU);
+      ctx.fill();
+
+      drawSkullMark(fighter.x, fighter.y - 4, 7);
+
+      ctx.fillStyle = "#ffe7b3";
+      ctx.fillRect(fighter.x - 32, fighter.y - 32, 64, 5);
+      ctx.fillStyle = "#ff7676";
+      ctx.fillRect(fighter.x - 32, fighter.y - 32, 64 * (fighter.hp / fighter.maxHp), 5);
+      return;
+    }
+
     const swordAngle =
       bossIntroTimer > 0
         ? fighter.dir
@@ -2095,11 +2406,27 @@ function drawFighter(fighter: Fighter) {
     ctx.fill();
 
     if (bossShieldActive()) {
-      ctx.strokeStyle = `rgba(180, 215, 255, ${0.65 + Math.sin(elapsed * 10) * 0.18})`;
+      const shieldRadius = fighter.radius + 12;
+      const shieldSpin = elapsed * 5.2;
+      const shieldAlpha = 0.65 + Math.sin(elapsed * 10) * 0.18;
+      ctx.strokeStyle = `rgba(180, 215, 255, ${shieldAlpha})`;
       ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(fighter.x, fighter.y, fighter.radius + 12, 0, TAU);
-      ctx.stroke();
+
+      for (let segment = 0; segment < 4; segment += 1) {
+        const start = shieldSpin + segment * (TAU / 4);
+        ctx.beginPath();
+        ctx.arc(fighter.x, fighter.y, shieldRadius, start, start + 0.72);
+        ctx.stroke();
+      }
+
+      ctx.strokeStyle = `rgba(255, 244, 196, ${0.22 + shieldAlpha * 0.25})`;
+      ctx.lineWidth = 1.5;
+      for (let segment = 0; segment < 4; segment += 1) {
+        const start = -shieldSpin * 1.25 + segment * (TAU / 4) + 0.18;
+        ctx.beginPath();
+        ctx.arc(fighter.x, fighter.y, shieldRadius - 4, start, start + 0.42);
+        ctx.stroke();
+      }
     }
 
     ctx.strokeStyle = "#d9dde4";
@@ -2188,6 +2515,10 @@ function drawFighter(fighter: Fighter) {
   }
   ctx.fillRect(fighter.x - 4, fighter.y - 2, 3, 3);
   ctx.fillRect(fighter.x + 1, fighter.y - 2, 3, 3);
+
+  if (fighter.headMark === "skull") {
+    drawSkullMark(fighter.x, fighter.y - fighter.radius - 2, 3);
+  }
 
   ctx.fillStyle = "#ffe7b3";
   const barWidth = 16;
@@ -2299,7 +2630,7 @@ function drawMeteors() {
 
 function drawBossTelegraphs() {
   const boss = getBoss();
-  if (!boss) {
+  if (!boss || boss.bossKind !== "iron") {
     return;
   }
 
@@ -2307,7 +2638,7 @@ function drawBossTelegraphs() {
     ctx.strokeStyle = "rgba(255, 224, 164, 0.55)";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(boss.x, boss.y, 42, 0, TAU);
+    ctx.arc(boss.x, boss.y, 84, 0, TAU);
     ctx.stroke();
     return;
   }
@@ -2348,7 +2679,7 @@ function drawBossHud() {
   ctx.fillRect(WORLD_WIDTH / 2 - 112, 8, 224, 18);
   ctx.fillStyle = "#ffd4d4";
   ctx.font = "bold 9px monospace";
-  ctx.fillText("IRON HELMET", WORLD_WIDTH / 2 - 28, 16);
+  ctx.fillText(boss.bossKind === "skull" ? "SKULL LORD" : "IRON HELMET", WORLD_WIDTH / 2 - 28, 16);
   ctx.fillStyle = "#633333";
   ctx.fillRect(WORLD_WIDTH / 2 - 100, 18, 200, 6);
   ctx.fillStyle = "#ff6e6e";
@@ -2389,18 +2720,6 @@ function drawMedkits() {
   }
 }
 
-function drawMinePickups() {
-  for (const minePickup of minePickups) {
-    ctx.fillStyle = "#4b4b56";
-    ctx.fillRect(minePickup.x - 5, minePickup.y - 5, 10, 10);
-    ctx.fillStyle = "#e66a4f";
-    ctx.fillRect(minePickup.x - 1, minePickup.y - 1, 2, 2);
-    ctx.fillStyle = "#c7c7d1";
-    ctx.fillRect(minePickup.x - 6, minePickup.y, 12, 1);
-    ctx.fillRect(minePickup.x, minePickup.y - 6, 1, 12);
-  }
-}
-
 function drawShieldPickups() {
   for (const shieldPickup of shieldPickups) {
     ctx.strokeStyle = "#9ad3ff";
@@ -2414,17 +2733,6 @@ function drawShieldPickups() {
     ctx.beginPath();
     ctx.arc(shieldPickup.x, shieldPickup.y, 3, 0, TAU);
     ctx.stroke();
-  }
-}
-
-function drawPlacedMines() {
-  for (const mine of placedMines) {
-    ctx.fillStyle = "#3b3d45";
-    ctx.beginPath();
-    ctx.arc(mine.x, mine.y, 5, 0, TAU);
-    ctx.fill();
-    ctx.fillStyle = "#ff6856";
-    ctx.fillRect(mine.x - 1, mine.y - 1, 2, 2);
   }
 }
 
@@ -2598,11 +2906,10 @@ function drawHud() {
   ctx.fillText(getActivePlayerWeapon(player).toUpperCase(), 14, 54);
   ctx.fillText(`CRIT ${Math.round(player.critChance * 100)}%`, 14, 64);
   ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 74);
-  ctx.fillText(`MINES ${player.mineCount}`, 14, 84);
-  ctx.fillText(`SHLD ${player.shieldCount}`, 14, 94);
-  ctx.fillText(`RAGE ${Math.round(player.rageCharge)}%`, 14, 104);
-  ctx.fillText(`TIME ${minutes}:${seconds.toString().padStart(2, "0")}`, 14, 114);
-  ctx.fillText(getPhaseLabel(), 14, 124);
+  ctx.fillText(`SHLD ${player.shieldCount}`, 14, 84);
+  ctx.fillText(`RAGE ${Math.round(player.rageCharge)}%`, 14, 94);
+  ctx.fillText(`TIME ${minutes}:${seconds.toString().padStart(2, "0")}`, 14, 104);
+  ctx.fillText(getPhaseLabel(), 14, 114);
 
   if (player.shieldTimer > 0) {
     ctx.fillStyle = "rgba(95, 193, 255, 0.3)";
@@ -2798,9 +3105,7 @@ function render() {
   drawArena();
   drawSpawnWarnings();
   drawMedkits();
-  drawMinePickups();
   drawShieldPickups();
-  drawPlacedMines();
   drawStars();
   drawBullets();
   drawExplosions();
@@ -2991,6 +3296,28 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (event.code === "BracketLeft") {
+    stepDevStage(-1);
+    event.preventDefault();
+    return;
+  }
+
+  if (event.code === "BracketRight") {
+    stepDevStage(1);
+    event.preventDefault();
+    return;
+  }
+
+  if (event.code === "Backslash") {
+    devInfiniteHealth = !devInfiniteHealth;
+    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    if (devInfiniteHealth && player) {
+      player.hp = player.maxHp;
+    }
+    event.preventDefault();
+    return;
+  }
+
   if (event.code === "KeyP" || event.code === "Escape") {
     togglePause();
     event.preventDefault();
@@ -2999,12 +3326,6 @@ window.addEventListener("keydown", (event) => {
 
   setMovementKey(event.code, true);
   if (event.code === "KeyE") {
-    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
-    if (player && !isPaused) {
-      placeMine(player);
-    }
-  }
-  if (event.code === "KeyF") {
     const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
     if (player && !isPaused) {
       activateShield(player);

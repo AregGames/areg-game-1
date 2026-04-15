@@ -17,6 +17,7 @@ Open `http://localhost:5173`.
 - Mouse: aim
 - Left click: shoot
 - `1` to `5`: switch between unlocked weapons
+- `E`: activate shield
 - `P` or `Esc`: pause / resume
 
 ## Goal
@@ -57,6 +58,11 @@ Rules:
 
 - Only one medkit can exist on the map at a time.
 - Touching it restores health.
+
+### Shield Pickup
+
+- Touching it adds one shield charge.
+- Press `E` to activate a stored shield charge.
 
 ### Blue Star
 
