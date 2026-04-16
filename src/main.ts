@@ -1467,12 +1467,6 @@ function updateBoss(boss: Fighter, dt: number) {
     return;
   }
 
-  bossSwordContactTick = Math.max(0, bossSwordContactTick - dt);
-  if (bossSwordContactTick <= 0) {
-    damageTargetsTouchingBossSword(boss, 10, 8);
-    bossSwordContactTick = 0.18;
-  }
-
   if (!bossAttackType) {
     queueBossAttack(boss, player);
     return;
