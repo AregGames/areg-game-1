@@ -16,6 +16,14 @@ const IS_MOBILE_VIEWPORT = window.matchMedia("(pointer: coarse)").matches;
 const WORLD_WIDTH = IS_MOBILE_VIEWPORT ? 400 : 480;
 const WORLD_HEIGHT = IS_MOBILE_VIEWPORT ? 225 : 270;
 const TAU = Math.PI * 2;
+const BOSS1_SHIELD_RADIUS_SCALE = 0.7;
+const BOSS1_SHIELD_SPIN_SPEED = 1.7;
+const BOSS1_SHIELD_ARC_PORTION = 0.3;
+const BOSS1_SHIELD_LINE_WIDTH = 3;
+const SKULL_BOSS_PROJECTILE_WINDUP = 0.05;
+const MAX_SIMULTANEOUS_ENEMIES = 15;
+const NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE = 0.5;
+const LIVE_RELOAD_STATE_KEY = "pixel-bot-brawler:dev-state";
 const AudioContextClass = window.AudioContext || (window as typeof window & {
   webkitAudioContext?: typeof AudioContext;
 }).webkitAudioContext;
@@ -141,6 +149,50 @@ type Explosion = {
 
 type BossKind = "none" | "iron" | "skull";
 type BossAttackType = "targeted" | "forward" | "left" | "right";
+type RuntimeSnapshot = {
+  fighters: Fighter[];
+  bullets: Bullet[];
+  lightningStrikes: LightningStrike[];
+  meteors: Meteor[];
+  burningFloors: BurningFloor[];
+  medkits: Medkit[];
+  stars: StarPickup[];
+  shieldPickups: ShieldPickup[];
+  explosions: Explosion[];
+  nextId: number;
+  elapsed: number;
+  lightningCooldown: number;
+  meteorCooldown: number;
+  medkitCooldown: number;
+  starCooldown: number;
+  shieldPickupCooldown: number;
+  selectedWeapon: WeaponType;
+  highestUnlockedWeapon: WeaponType;
+  isPaused: boolean;
+  showRulesMenu: boolean;
+  rulesScroll: number;
+  mobileFullscreenAttempted: boolean;
+  pendingRunReset: boolean;
+  devInfiniteHealth: boolean;
+  survivalWithoutDeath: number;
+  bossFightStarted: boolean;
+  bossFightWon: boolean;
+  bossIntroTimer: number;
+  bossAttackType: BossAttackType | null;
+  bossAttackWindup: number;
+  bossAttackActive: number;
+  bossAttackRecover: number;
+  bossAttackIndex: number;
+  bossAttackAngle: number;
+  bossAttackHitApplied: boolean;
+  bossSpinDamageTick: number;
+  bossSwordContactTick: number;
+  skullBossActionTimer: number;
+  skullBossActionIndex: number;
+  skullBossBurstShotsLeft: number;
+  skullBossBurstWindup: number;
+  bossesDefeated: number;
+};
 
 const input = {
   up: false,
@@ -216,6 +268,7 @@ let skullBossActionIndex = 0;
 let skullBossBurstShotsLeft = 0;
 let skullBossBurstWindup = 0;
 let bossesDefeated = 0;
+let liveReloadSaveTimer = 0;
 
 const bossAttackPattern: BossAttackType[] = ["targeted", "targeted", "forward", "left", "right", "left", "left"];
 
@@ -446,11 +499,14 @@ function spawnRoster() {
 function spawnEnemyWave() {
   const enemyPaletteOrder = [1, 2, 3, 1, 2, 3];
   const waveCount = getWaveEnemyCount();
+  const activeEnemies = fighters.filter((fighter) => fighter.team === "enemy" && fighter.respawn <= 0).length;
+  const availableSlots = Math.max(0, MAX_SIMULTANEOUS_ENEMIES - activeEnemies);
+  const spawnCount = Math.min(waveCount, availableSlots);
   const reservedSpawns = fighters
     .filter((fighter) => fighter.respawn <= 0)
     .map((fighter) => ({ x: fighter.x, y: fighter.y, radius: fighter.radius }));
 
-  for (let index = 0; index < waveCount; index += 1) {
+  for (let index = 0; index < spawnCount; index += 1) {
     const colorIndex = enemyPaletteOrder[index % enemyPaletteOrder.length];
     const enemy = createFighter(0, 0, false, colorIndex);
     applyEnemyScaling(enemy, index);
@@ -1092,7 +1148,8 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      const damage = playerHasInfiniteHealth(enemy) ? 0 : enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : 10;
+      const baseDamage = enemy.team === "player" ? 10 * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE : 10;
+      const damage = playerHasInfiniteHealth(enemy) ? 0 : enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : baseDamage;
       enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
@@ -1239,6 +1296,39 @@ function bossShieldActive() {
   return bossFightStarted && bossIntroTimer > 0 && boss?.bossKind === "iron";
 }
 
+function getBoss1ShieldRadius(boss: Fighter) {
+  return (boss.radius + 12) * BOSS1_SHIELD_RADIUS_SCALE;
+}
+
+function getBoss1ShieldArcLength() {
+  return TAU * BOSS1_SHIELD_ARC_PORTION;
+}
+
+function getBoss1ShieldSpin() {
+  return elapsed * BOSS1_SHIELD_SPIN_SPEED;
+}
+
+function bulletHitsBoss1Shield(bullet: Bullet, boss: Fighter) {
+  if (boss.bossKind !== "iron" || !bossShieldActive()) {
+    return false;
+  }
+
+  const dx = bullet.x - boss.x;
+  const dy = bullet.y - boss.y;
+  const distanceFromBoss = Math.hypot(dx, dy);
+  const shieldRadius = getBoss1ShieldRadius(boss);
+  const shieldHalfThickness = BOSS1_SHIELD_LINE_WIDTH * 0.5 + 0.5;
+
+  if (Math.abs(distanceFromBoss - shieldRadius) > shieldHalfThickness + bullet.size) {
+    return false;
+  }
+
+  const shieldArcLength = getBoss1ShieldArcLength();
+  const shieldCenterAngle = getBoss1ShieldSpin() + shieldArcLength * 0.5;
+  const bulletAngle = Math.atan2(dy, dx);
+  return angleDifference(bulletAngle, shieldCenterAngle) <= shieldArcLength * 0.5;
+}
+
 function queueBossAttack(boss: Fighter, player: Fighter | null) {
   bossAttackType = bossAttackPattern[bossAttackIndex % bossAttackPattern.length];
   bossAttackWindup = bossAttackType === "forward" ? 0.95 : bossAttackType === "targeted" ? 0.8 : 1.05;
@@ -1308,8 +1398,12 @@ function damageTargetsTouchingBossSword(boss: Fighter, damage: number, knockback
   }
 }
 
-function spawnSkullBossProjectile(boss: Fighter, target: Fighter | null) {
-  const angle = target ? Math.atan2(target.y - boss.y, target.x - boss.x) : boss.dir;
+function spawnSkullBossProjectile(boss: Fighter) {
+  const edgeAngle = Math.random() * TAU;
+  const edgeRadius = getBossArenaRadius() - 6;
+  const edgeX = WORLD_WIDTH / 2 + Math.cos(edgeAngle) * edgeRadius;
+  const edgeY = WORLD_HEIGHT / 2 + Math.sin(edgeAngle) * edgeRadius;
+  const angle = Math.atan2(edgeY - boss.y, edgeX - boss.x);
   const arenaRadius = getBossArenaRadius() - 6;
   const speed = 72;
   bullets.push({
@@ -1330,11 +1424,14 @@ function spawnSkullBossProjectile(boss: Fighter, target: Fighter | null) {
 }
 
 function spawnSkullMinions(count: number) {
+  const activeEnemies = fighters.filter((fighter) => fighter.team === "enemy" && fighter.respawn <= 0).length;
+  const availableSlots = Math.max(0, MAX_SIMULTANEOUS_ENEMIES - activeEnemies);
+  const spawnCount = Math.min(count, availableSlots);
   const reservedSpawns = fighters
     .filter((fighter) => fighter.respawn <= 0)
     .map((fighter) => ({ x: fighter.x, y: fighter.y, radius: fighter.radius }));
 
-  for (let index = 0; index < count; index += 1) {
+  for (let index = 0; index < spawnCount; index += 1) {
     const minion = createFighter(0, 0, false, 1 + (index % 3));
     minion.team = "enemy";
     minion.archetype = "melee";
@@ -1403,10 +1500,10 @@ function updateSkullBoss(boss: Fighter, dt: number) {
   if (skullBossBurstShotsLeft > 0) {
     skullBossBurstWindup = Math.max(0, skullBossBurstWindup - dt);
     while (skullBossBurstShotsLeft > 0 && skullBossBurstWindup <= 0) {
-      spawnSkullBossProjectile(boss, player);
+      spawnSkullBossProjectile(boss);
       skullBossBurstShotsLeft -= 1;
       if (skullBossBurstShotsLeft > 0) {
-        skullBossBurstWindup += 0.025;
+        skullBossBurstWindup += SKULL_BOSS_PROJECTILE_WINDUP;
       }
     }
 
@@ -1425,7 +1522,7 @@ function updateSkullBoss(boss: Fighter, dt: number) {
   const action = skullBossActionIndex % 3;
   if (action === 0) {
     skullBossBurstShotsLeft = 20;
-    skullBossBurstWindup = 0.025;
+    skullBossBurstWindup = SKULL_BOSS_PROJECTILE_WINDUP;
     skullBossActionTimer = 0;
   } else if (action === 1) {
     spawnSkullMinions(5);
@@ -1453,7 +1550,7 @@ function updateBoss(boss: Fighter, dt: number) {
 
   if (bossIntroTimer > 0) {
     bossIntroTimer = Math.max(0, bossIntroTimer - dt);
-    boss.dir += dt * 1.7;
+    boss.dir += dt * BOSS1_SHIELD_SPIN_SPEED;
     bossSpinDamageTick -= dt;
 
     if (bossSpinDamageTick <= 0) {
@@ -1617,6 +1714,8 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
 
   if (target.isBoss) {
     const defeatedBossKind = target.bossKind;
+    const bossDeathX = target.x;
+    const bossDeathY = target.y;
     const index = fighters.findIndex((fighter) => fighter.id === target.id);
     if (index >= 0) {
       fighters.splice(index, 1);
@@ -1636,7 +1735,10 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
     skullBossBurstWindup = 0;
     bossesDefeated += 1;
     clearAmbientHazards();
-    spawnEnemyWave();
+    if (defeatedBossKind !== "skull") {
+      spawnEnemyWave();
+    }
+    spawnBossBlueStars(bossDeathX, bossDeathY);
     if (owner) {
       owner.score += defeatedBossKind === "skull" ? 14 : 10;
     }
@@ -1698,13 +1800,17 @@ function applyProjectileDamage(
   knockback: number,
   owner: Fighter | null
 ) {
+  const scaledDamage =
+    target.team === "player" && owner?.team === "enemy" && !owner.isBoss
+      ? damage * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE
+      : damage;
   const appliedDamage = playerHasInfiniteHealth(target)
     ? 0
     : target.rageTimer > 0
       ? 0
       : target.shieldTimer > 0
         ? 0
-        : damage;
+        : scaledDamage;
 
   target.hp -= appliedDamage;
   target.flash = 0.18;
@@ -1773,10 +1879,9 @@ function updateBullets(dt: number) {
     const owner = fighters.find((candidate) => candidate.id === bullet.ownerId) ?? null;
     if (
       boss &&
-      bossShieldActive() &&
       owner &&
       owner.team !== "enemy" &&
-      Math.hypot(bullet.x - boss.x, bullet.y - boss.y) < boss.radius + 12 + bullet.size
+      bulletHitsBoss1Shield(bullet, boss)
     ) {
       reflectBulletOffBoss(bullet, boss);
       continue;
@@ -1906,6 +2011,20 @@ function spawnStar() {
     y: 28 + Math.random() * (WORLD_HEIGHT - 56),
     color: Math.random() < 0.5 ? "blue" : "red"
   });
+}
+
+function spawnBossBlueStars(centerX: number, centerY: number) {
+  for (let index = 0; index < 3; index += 1) {
+    const angle = (index / 3) * TAU + Math.random() * 0.35;
+    const distance = 10 + Math.random() * 10;
+    const x = Math.max(28, Math.min(WORLD_WIDTH - 28, centerX + Math.cos(angle) * distance));
+    const y = Math.max(28, Math.min(WORLD_HEIGHT - 28, centerY + Math.sin(angle) * distance));
+    stars.push({
+      x,
+      y,
+      color: "blue"
+    });
+  }
 }
 
 function spawnShieldPickup() {
@@ -2261,6 +2380,12 @@ function update(dt: number) {
   if (shouldResetRoster) {
     spawnRoster();
   }
+
+  liveReloadSaveTimer -= dt;
+  if (liveReloadSaveTimer <= 0) {
+    saveRuntimeSnapshot();
+    liveReloadSaveTimer = 0.25;
+  }
 }
 
 function drawArena() {
@@ -2400,27 +2525,15 @@ function drawFighter(fighter: Fighter) {
     ctx.fill();
 
     if (bossShieldActive()) {
-      const shieldRadius = fighter.radius + 12;
-      const shieldSpin = elapsed * 5.2;
+      const shieldRadius = getBoss1ShieldRadius(fighter);
+      const shieldSpin = getBoss1ShieldSpin();
+      const shieldArcLength = getBoss1ShieldArcLength();
       const shieldAlpha = 0.65 + Math.sin(elapsed * 10) * 0.18;
       ctx.strokeStyle = `rgba(180, 215, 255, ${shieldAlpha})`;
-      ctx.lineWidth = 3;
-
-      for (let segment = 0; segment < 4; segment += 1) {
-        const start = shieldSpin + segment * (TAU / 4);
-        ctx.beginPath();
-        ctx.arc(fighter.x, fighter.y, shieldRadius, start, start + 0.72);
-        ctx.stroke();
-      }
-
-      ctx.strokeStyle = `rgba(255, 244, 196, ${0.22 + shieldAlpha * 0.25})`;
-      ctx.lineWidth = 1.5;
-      for (let segment = 0; segment < 4; segment += 1) {
-        const start = -shieldSpin * 1.25 + segment * (TAU / 4) + 0.18;
-        ctx.beginPath();
-        ctx.arc(fighter.x, fighter.y, shieldRadius - 4, start, start + 0.42);
-        ctx.stroke();
-      }
+      ctx.lineWidth = BOSS1_SHIELD_LINE_WIDTH;
+      ctx.beginPath();
+      ctx.arc(fighter.x, fighter.y, shieldRadius, shieldSpin, shieldSpin + shieldArcLength);
+      ctx.stroke();
     }
 
     ctx.strokeStyle = "#d9dde4";
@@ -3153,6 +3266,16 @@ function setMovementKey(code: string, isPressed: boolean) {
   if (code === "KeyD" || code === "ArrowRight") input.right = isPressed;
 }
 
+function resetMovementInputState() {
+  input.up = false;
+  input.down = false;
+  input.left = false;
+  input.right = false;
+  input.moveX = 0;
+  input.moveY = 0;
+  resetTouchMovement();
+}
+
 function trySelectWeapon(slot: number) {
   const player = fighters.find((fighter) => fighter.team === "player");
   if (!player) {
@@ -3350,6 +3473,10 @@ window.addEventListener("keyup", (event) => {
     event.preventDefault();
   }
 });
+window.addEventListener("blur", () => {
+  resetMovementInputState();
+  input.shoot = false;
+});
 
 canvas.addEventListener("wheel", (event) => {
   if (!isPaused || !showRulesMenu) {
@@ -3468,6 +3595,125 @@ function releaseTouch(identifier: number) {
   }
 }
 
+function saveRuntimeSnapshot() {
+  const snapshot: RuntimeSnapshot = {
+    fighters: structuredClone(fighters),
+    bullets: structuredClone(bullets),
+    lightningStrikes: structuredClone(lightningStrikes),
+    meteors: structuredClone(meteors),
+    burningFloors: structuredClone(burningFloors),
+    medkits: structuredClone(medkits),
+    stars: structuredClone(stars),
+    shieldPickups: structuredClone(shieldPickups),
+    explosions: structuredClone(explosions),
+    nextId,
+    elapsed,
+    lightningCooldown,
+    meteorCooldown,
+    medkitCooldown,
+    starCooldown,
+    shieldPickupCooldown,
+    selectedWeapon,
+    highestUnlockedWeapon,
+    isPaused,
+    showRulesMenu,
+    rulesScroll,
+    mobileFullscreenAttempted,
+    pendingRunReset,
+    devInfiniteHealth,
+    survivalWithoutDeath,
+    bossFightStarted,
+    bossFightWon,
+    bossIntroTimer,
+    bossAttackType,
+    bossAttackWindup,
+    bossAttackActive,
+    bossAttackRecover,
+    bossAttackIndex,
+    bossAttackAngle,
+    bossAttackHitApplied,
+    bossSpinDamageTick,
+    bossSwordContactTick,
+    skullBossActionTimer,
+    skullBossActionIndex,
+    skullBossBurstShotsLeft,
+    skullBossBurstWindup,
+    bossesDefeated
+  };
+
+  sessionStorage.setItem(LIVE_RELOAD_STATE_KEY, JSON.stringify(snapshot));
+}
+
+function restoreRuntimeSnapshot() {
+  const raw = sessionStorage.getItem(LIVE_RELOAD_STATE_KEY);
+  if (!raw) {
+    return false;
+  }
+
+  try {
+    const snapshot = JSON.parse(raw) as RuntimeSnapshot;
+    if (!Array.isArray(snapshot.fighters) || !Array.isArray(snapshot.bullets)) {
+      return false;
+    }
+
+    fighters.length = 0;
+    fighters.push(...snapshot.fighters);
+    bullets.length = 0;
+    bullets.push(...snapshot.bullets);
+    lightningStrikes.length = 0;
+    lightningStrikes.push(...snapshot.lightningStrikes);
+    meteors.length = 0;
+    meteors.push(...snapshot.meteors);
+    burningFloors.length = 0;
+    burningFloors.push(...snapshot.burningFloors);
+    medkits.length = 0;
+    medkits.push(...snapshot.medkits);
+    stars.length = 0;
+    stars.push(...snapshot.stars);
+    shieldPickups.length = 0;
+    shieldPickups.push(...snapshot.shieldPickups);
+    explosions.length = 0;
+    explosions.push(...snapshot.explosions);
+
+    nextId = snapshot.nextId;
+    elapsed = snapshot.elapsed;
+    lightningCooldown = snapshot.lightningCooldown;
+    meteorCooldown = snapshot.meteorCooldown;
+    medkitCooldown = snapshot.medkitCooldown;
+    starCooldown = snapshot.starCooldown;
+    shieldPickupCooldown = snapshot.shieldPickupCooldown;
+    selectedWeapon = snapshot.selectedWeapon;
+    highestUnlockedWeapon = snapshot.highestUnlockedWeapon;
+    isPaused = snapshot.isPaused;
+    showRulesMenu = snapshot.showRulesMenu;
+    rulesScroll = snapshot.rulesScroll;
+    mobileFullscreenAttempted = snapshot.mobileFullscreenAttempted;
+    pendingRunReset = snapshot.pendingRunReset;
+    devInfiniteHealth = snapshot.devInfiniteHealth;
+    survivalWithoutDeath = snapshot.survivalWithoutDeath;
+    bossFightStarted = snapshot.bossFightStarted;
+    bossFightWon = snapshot.bossFightWon;
+    bossIntroTimer = snapshot.bossIntroTimer;
+    bossAttackType = snapshot.bossAttackType;
+    bossAttackWindup = snapshot.bossAttackWindup;
+    bossAttackActive = snapshot.bossAttackActive;
+    bossAttackRecover = snapshot.bossAttackRecover;
+    bossAttackIndex = snapshot.bossAttackIndex;
+    bossAttackAngle = snapshot.bossAttackAngle;
+    bossAttackHitApplied = snapshot.bossAttackHitApplied;
+    bossSpinDamageTick = snapshot.bossSpinDamageTick;
+    bossSwordContactTick = snapshot.bossSwordContactTick;
+    skullBossActionTimer = snapshot.skullBossActionTimer;
+    skullBossActionIndex = snapshot.skullBossActionIndex;
+    skullBossBurstShotsLeft = snapshot.skullBossBurstShotsLeft;
+    skullBossBurstWindup = snapshot.skullBossBurstWindup;
+    bossesDefeated = snapshot.bossesDefeated;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 canvas.addEventListener("touchend", (event) => {
   for (const touch of event.changedTouches) {
     releaseTouch(touch.identifier);
@@ -3488,6 +3734,19 @@ window.addEventListener("mouseup", () => {
   input.shoot = false;
 });
 
-spawnRoster();
+window.addEventListener("beforeunload", () => {
+  saveRuntimeSnapshot();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    resetMovementInputState();
+    input.shoot = false;
+    saveRuntimeSnapshot();
+  }
+});
+
+if (!restoreRuntimeSnapshot()) {
+  spawnRoster();
+}
 render();
 requestAnimationFrame(frame);
