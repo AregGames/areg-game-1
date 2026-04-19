@@ -35,6 +35,11 @@ const ORBITAL_SWORD_SPIN_SPEED = 5.4;
 const ORBITAL_SWORD_DAMAGE = 30;
 const ORBITAL_SWORD_DAMAGE_TICK = 0.25;
 const REGEN_AMOUNT_PER_SECOND = 3;
+const AUDIO_MASTER_GAIN = 0.42;
+const SHOP_DENY_SOUND_COOLDOWN = 0.3;
+const SHOP_READY_BUTTON_WIDTH = 78;
+const SHOP_READY_BUTTON_HEIGHT = 16;
+const DEBUG_SHOP_POINTS_BONUS = 10;
 const LIVE_RELOAD_STATE_KEY = "pixel-bot-brawler:dev-state";
 const AudioContextClass = window.AudioContext || (window as typeof window & {
   webkitAudioContext?: typeof AudioContext;
@@ -185,9 +190,13 @@ type RuntimeSnapshot = {
   shieldPickups: ShieldPickup[];
   explosions: Explosion[];
   shopItems: ShopItem[];
-  hasSwordUpgrade: boolean;
-  hasRegenUpgrade: boolean;
-  hasAttackSpeedUpgrade: boolean;
+  shopPhaseActive: boolean;
+  swordUpgradeLevel: number;
+  regenUpgradeLevel: number;
+  attackSpeedUpgradeLevel: number;
+  hasSwordUpgrade?: boolean;
+  hasRegenUpgrade?: boolean;
+  hasAttackSpeedUpgrade?: boolean;
   swordSpawnTimer: number;
   regenTickTimer: number;
   orbitingSwords: OrbitingSword[];
@@ -259,6 +268,8 @@ const bullets: Bullet[] = [];
 let nextId = 1;
 let elapsed = 0;
 let audioContext: AudioContext | null = null;
+let audioMasterGain: GainNode | null = null;
+let audioCompressor: DynamicsCompressorNode | null = null;
 let audioEnabled = false;
 let lightningCooldown = 2.4;
 const lightningStrikes: LightningStrike[] = [];
@@ -273,9 +284,10 @@ let shieldPickupCooldown = 18;
 const shieldPickups: ShieldPickup[] = [];
 const explosions: Explosion[] = [];
 const shopItems: ShopItem[] = [];
-let hasSwordUpgrade = false;
-let hasRegenUpgrade = false;
-let hasAttackSpeedUpgrade = false;
+let shopPhaseActive = false;
+let swordUpgradeLevel = 0;
+let regenUpgradeLevel = 0;
+let attackSpeedUpgradeLevel = 0;
 let swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
 let regenTickTimer = 1;
 const orbitingSwords: OrbitingSword[] = [];
@@ -308,6 +320,7 @@ let skullBossBurstShotsLeft = 0;
 let skullBossBurstWindup = 0;
 let bossesDefeated = 0;
 let liveReloadSaveTimer = 0;
+let shopDenySoundCooldown = 0;
 
 const bossAttackPattern: BossAttackType[] = ["targeted", "targeted", "forward", "left", "right", "left", "left"];
 
@@ -319,13 +332,15 @@ const palette = [
 ];
 
 const devStageSnapshots = [
-  { survival: 0, bossesDefeated: 0, boss: "none" as BossKind },
-  { survival: 30, bossesDefeated: 0, boss: "none" as BossKind },
-  { survival: 59, bossesDefeated: 0, boss: "none" as BossKind },
-  { survival: 60, bossesDefeated: 0, boss: "iron" as BossKind },
-  { survival: 75, bossesDefeated: 1, boss: "none" as BossKind },
-  { survival: 120, bossesDefeated: 1, boss: "skull" as BossKind },
-  { survival: 130, bossesDefeated: 2, boss: "none" as BossKind }
+  { survival: 0, bossesDefeated: 0, boss: "none" as BossKind, shopPhase: false },
+  { survival: 30, bossesDefeated: 0, boss: "none" as BossKind, shopPhase: false },
+  { survival: 59, bossesDefeated: 0, boss: "none" as BossKind, shopPhase: false },
+  { survival: 60, bossesDefeated: 0, boss: "iron" as BossKind, shopPhase: false },
+  { survival: 61, bossesDefeated: 1, boss: "none" as BossKind, shopPhase: true },
+  { survival: 75, bossesDefeated: 1, boss: "none" as BossKind, shopPhase: false },
+  { survival: 120, bossesDefeated: 1, boss: "skull" as BossKind, shopPhase: false },
+  { survival: 121, bossesDefeated: 2, boss: "none" as BossKind, shopPhase: true },
+  { survival: 130, bossesDefeated: 2, boss: "none" as BossKind, shopPhase: false }
 ];
 
 const rulesLines = [
@@ -505,11 +520,13 @@ function spawnRoster() {
   explosions.length = 0;
   orbitingSwords.length = 0;
   shopItems.length = 0;
-  hasSwordUpgrade = false;
-  hasRegenUpgrade = false;
-  hasAttackSpeedUpgrade = false;
+  shopPhaseActive = false;
+  swordUpgradeLevel = 0;
+  regenUpgradeLevel = 0;
+  attackSpeedUpgradeLevel = 0;
   swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = 1;
+  shopDenySoundCooldown = 0;
   lightningCooldown = 2.4;
   meteorCooldown = 5.2;
   medkitCooldown = 4.5;
@@ -591,7 +608,7 @@ function playerHasInfiniteHealth(target: Fighter) {
 
 function ensureEnemyWavePresent() {
   const activeEnemies = fighters.some((fighter) => fighter.team === "enemy" && fighter.respawn <= 0);
-  if (!activeEnemies && !bossFightStarted && shopItems.length === 0) {
+  if (!activeEnemies && !bossFightStarted && !shopPhaseActive) {
     spawnEnemyWave();
   }
 }
@@ -602,13 +619,15 @@ function applyDevStage(stageIndex: number) {
 
   clearAmbientHazards();
   despawnEnemies();
-  orbitingSwords.length = 0;
+  if (swordUpgradeLevel <= 0) {
+    orbitingSwords.length = 0;
+  }
   shopItems.length = 0;
-  hasSwordUpgrade = false;
-  hasRegenUpgrade = false;
-  hasAttackSpeedUpgrade = false;
-  swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
-  regenTickTimer = 1;
+  shopPhaseActive = false;
+  if (swordUpgradeLevel > 0) {
+    swordSpawnTimer = Math.min(swordSpawnTimer, 0.05);
+  }
+  shopDenySoundCooldown = 0;
   survivalWithoutDeath = snapshot.survival;
   bossesDefeated = snapshot.bossesDefeated;
   bossFightStarted = false;
@@ -648,6 +667,8 @@ function applyDevStage(stageIndex: number) {
 
   if (snapshot.boss === "iron" || snapshot.boss === "skull") {
     startBossFight(snapshot.boss);
+  } else if (snapshot.shopPhase) {
+    spawnShopItems();
   } else {
     ensureEnemyWavePresent();
   }
@@ -655,17 +676,23 @@ function applyDevStage(stageIndex: number) {
 
 function getCurrentDevStageIndex() {
   const boss = getBoss();
+  if (shopPhaseActive && bossesDefeated >= 2) {
+    return 7;
+  }
   if (bossFightStarted && boss?.bossKind === "skull") {
-    return 5;
+    return 6;
+  }
+  if (shopPhaseActive && bossesDefeated >= 1) {
+    return 4;
   }
   if (bossFightStarted && boss?.bossKind === "iron") {
     return 3;
   }
   if (bossesDefeated >= 2) {
-    return 6;
+    return 8;
   }
   if (bossesDefeated >= 1) {
-    return 4;
+    return 5;
   }
   if (survivalWithoutDeath >= 59) {
     return 2;
@@ -896,7 +923,34 @@ function ensureAudio() {
   }
 
   audioContext = new AudioContextClass();
+  audioMasterGain = audioContext.createGain();
+  audioMasterGain.gain.setValueAtTime(AUDIO_MASTER_GAIN, audioContext.currentTime);
+
+  audioCompressor = audioContext.createDynamicsCompressor();
+  audioCompressor.threshold.setValueAtTime(-22, audioContext.currentTime);
+  audioCompressor.knee.setValueAtTime(18, audioContext.currentTime);
+  audioCompressor.ratio.setValueAtTime(6, audioContext.currentTime);
+  audioCompressor.attack.setValueAtTime(0.003, audioContext.currentTime);
+  audioCompressor.release.setValueAtTime(0.18, audioContext.currentTime);
+
+  audioMasterGain.connect(audioCompressor);
+  audioCompressor.connect(audioContext.destination);
   audioEnabled = true;
+}
+
+function jitterFrequency(frequency: number, spread = 0.02) {
+  return Math.max(30, frequency * (1 + (Math.random() * 2 - 1) * spread));
+}
+
+function connectToAudioOutput(node: AudioNode) {
+  if (!audioContext) {
+    return;
+  }
+  if (audioMasterGain) {
+    node.connect(audioMasterGain);
+    return;
+  }
+  node.connect(audioContext.destination);
 }
 
 function playTone(
@@ -914,50 +968,91 @@ function playTone(
   const oscillator = audioContext.createOscillator();
   const gainNode = audioContext.createGain();
   oscillator.type = type;
-  oscillator.frequency.setValueAtTime(frequency, start);
+  oscillator.frequency.setValueAtTime(jitterFrequency(frequency), start);
   if (slideTo !== undefined) {
-    oscillator.frequency.exponentialRampToValueAtTime(slideTo, start + duration);
+    oscillator.frequency.exponentialRampToValueAtTime(jitterFrequency(slideTo, 0.01), start + duration);
   }
 
+  const attack = Math.min(0.012, duration * 0.4);
   gainNode.gain.setValueAtTime(0.0001, start);
-  gainNode.gain.exponentialRampToValueAtTime(volume, start + 0.01);
+  gainNode.gain.exponentialRampToValueAtTime(volume, start + attack);
   gainNode.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
   oscillator.connect(gainNode);
-  gainNode.connect(audioContext.destination);
+  connectToAudioOutput(gainNode);
   oscillator.start(start);
   oscillator.stop(start + duration);
 }
 
+function playNoiseBurst(duration: number, volume: number, filterType: BiquadFilterType, cutoff: number) {
+  if (!audioContext || audioContext.state !== "running") {
+    return;
+  }
+
+  const bufferSize = Math.max(64, Math.floor(audioContext.sampleRate * duration));
+  const noiseBuffer = audioContext.createBuffer(1, bufferSize, audioContext.sampleRate);
+  const channel = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i += 1) {
+    channel[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+  }
+
+  const start = audioContext.currentTime;
+  const source = audioContext.createBufferSource();
+  source.buffer = noiseBuffer;
+  const filter = audioContext.createBiquadFilter();
+  filter.type = filterType;
+  filter.frequency.setValueAtTime(cutoff, start);
+  const gainNode = audioContext.createGain();
+  gainNode.gain.setValueAtTime(0.0001, start);
+  gainNode.gain.exponentialRampToValueAtTime(volume, start + Math.min(0.01, duration * 0.3));
+  gainNode.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+  source.connect(filter);
+  filter.connect(gainNode);
+  connectToAudioOutput(gainNode);
+  source.start(start);
+  source.stop(start + duration);
+}
+
 function playShootSound(isPlayer: boolean) {
-  playTone("square", isPlayer ? 700 : 430, isPlayer ? 0.08 : 0.06, isPlayer ? 0.035 : 0.018, isPlayer ? 420 : 280);
+  if (isPlayer) {
+    playTone("square", 700, 0.075, 0.032, 430);
+    playTone("triangle", 1040, 0.028, 0.009, 690);
+  } else {
+    playTone("square", 430, 0.06, 0.016, 280);
+  }
 }
 
 function playHitSound(isMelee: boolean) {
-  playTone(isMelee ? "triangle" : "sawtooth", isMelee ? 180 : 240, 0.07, isMelee ? 0.035 : 0.025, isMelee ? 120 : 170);
+  playTone(isMelee ? "triangle" : "sawtooth", isMelee ? 180 : 240, 0.07, isMelee ? 0.03 : 0.024, isMelee ? 120 : 170);
+  playNoiseBurst(0.045, isMelee ? 0.011 : 0.008, "highpass", isMelee ? 620 : 900);
 }
 
 function playDefeatSound() {
-  playTone("triangle", 220, 0.18, 0.04, 90);
+  playTone("triangle", 250, 0.1, 0.035, 140);
+  playTone("sawtooth", 180, 0.16, 0.028, 80);
 }
 
 function playLightningSound() {
-  playTone("sawtooth", 820, 0.12, 0.05, 220);
-  playTone("triangle", 180, 0.18, 0.03, 90);
+  playTone("sawtooth", 920, 0.12, 0.04, 260);
+  playTone("triangle", 240, 0.16, 0.024, 100);
+  playNoiseBurst(0.12, 0.018, "highpass", 1100);
 }
 
 function playMeteorSound() {
-  playTone("sawtooth", 210, 0.16, 0.05, 120);
-  playTone("triangle", 110, 0.22, 0.04, 70);
+  playTone("sawtooth", 190, 0.16, 0.038, 110);
+  playTone("triangle", 98, 0.23, 0.028, 64);
+  playNoiseBurst(0.2, 0.02, "lowpass", 260);
 }
 
 function playPickupSound() {
-  playTone("triangle", 480, 0.08, 0.03, 740);
+  playTone("triangle", 480, 0.08, 0.024, 740);
+  playTone("sine", 740, 0.07, 0.016, 980);
 }
 
 function playStarSound() {
-  playTone("sine", 620, 0.1, 0.03, 880);
-  playTone("triangle", 880, 0.12, 0.025, 1180);
+  playTone("sine", 620, 0.09, 0.022, 910);
+  playTone("triangle", 910, 0.11, 0.018, 1280);
 }
 
 function playHelperSound(color: "red" | "green") {
@@ -970,6 +1065,21 @@ function playHelperSound(color: "red" | "green") {
 
 function playShieldSound() {
   playTone("triangle", 320, 0.14, 0.035, 640);
+}
+
+function playShopOpenSound() {
+  playTone("triangle", 310, 0.1, 0.03, 520);
+  playTone("sine", 520, 0.12, 0.02, 760);
+}
+
+function playShopBuySound() {
+  playTone("sine", 560, 0.07, 0.02, 900);
+  playTone("triangle", 900, 0.09, 0.018, 1220);
+}
+
+function playShopDeniedSound() {
+  playTone("square", 200, 0.06, 0.014, 150);
+  playTone("sawtooth", 170, 0.06, 0.01, 130);
 }
 
 function getPlayerWeapon(score: number): WeaponType {
@@ -1081,7 +1191,7 @@ function shoot(fighter: Fighter) {
     const rageReloadFactor = fighter.rageTimer > 0 ? 0.45 : 1;
     const rageSpeedFactor = fighter.rageTimer > 0 ? 2 : 1;
     const playerSpeedFactor = 1.5;
-    const attackSpeedFactor = hasAttackSpeedUpgrade ? PLAYER_ATTACK_SPEED_MULTIPLIER : 1;
+    const attackSpeedFactor = Math.pow(PLAYER_ATTACK_SPEED_MULTIPLIER, attackSpeedUpgradeLevel);
 
     if (weapon === "pistol") {
       fighter.reload = (0.2 * rageReloadFactor) / attackSpeedFactor;
@@ -1732,11 +1842,13 @@ function clearRunStateOnPlayerDeath() {
   explosions.length = 0;
   orbitingSwords.length = 0;
   shopItems.length = 0;
-  hasSwordUpgrade = false;
-  hasRegenUpgrade = false;
-  hasAttackSpeedUpgrade = false;
+  shopPhaseActive = false;
+  swordUpgradeLevel = 0;
+  regenUpgradeLevel = 0;
+  attackSpeedUpgradeLevel = 0;
   swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = 1;
+  shopDenySoundCooldown = 0;
   survivalWithoutDeath = 0;
   bossFightStarted = false;
   bossFightWon = false;
@@ -1788,19 +1900,36 @@ function spawnShopItems() {
   ];
 
   for (const item of candidates) {
-    const alreadyOwned =
-      (item.itemType === "swords" && hasSwordUpgrade) ||
-      (item.itemType === "regen" && hasRegenUpgrade) ||
-      (item.itemType === "attackSpeed" && hasAttackSpeedUpgrade);
-    if (alreadyOwned) {
-      continue;
-    }
     shopItems.push({
       ...item,
       x: clamp(item.x, 18, WORLD_WIDTH - 18),
       y: clamp(item.y, 18, WORLD_HEIGHT - 18)
     });
   }
+
+  shopPhaseActive = shopItems.length > 0;
+  if (shopItems.length > 0) {
+    playShopOpenSound();
+  }
+}
+
+function getShopReadyButtonRect() {
+  return {
+    x: WORLD_WIDTH / 2 - SHOP_READY_BUTTON_WIDTH / 2,
+    y: touchControls.enabled ? WORLD_HEIGHT - 62 : WORLD_HEIGHT - 42,
+    width: SHOP_READY_BUTTON_WIDTH,
+    height: SHOP_READY_BUTTON_HEIGHT
+  };
+}
+
+function endShopPhase() {
+  if (!shopPhaseActive) {
+    return;
+  }
+  shopPhaseActive = false;
+  shopItems.length = 0;
+  ensureEnemyWavePresent();
+  playPickupSound();
 }
 
 function defeatFighter(target: Fighter, owner?: Fighter | null) {
@@ -2129,30 +2258,33 @@ function spawnBossBlueStars(centerX: number, centerY: number) {
 
 function tryBuyShopItemByTouch(player: Fighter, item: ShopItem) {
   if (item.itemType === "swords") {
-    if (hasSwordUpgrade || player.score < item.cost) {
+    if (player.score < item.cost) {
       return false;
     }
-    hasSwordUpgrade = true;
+    swordUpgradeLevel += 1;
     swordSpawnTimer = 0;
-    playPickupSound();
+    player.score -= item.cost;
+    playShopBuySound();
     return true;
   }
 
   if (item.itemType === "regen") {
-    if (hasRegenUpgrade || player.score < item.cost) {
+    if (player.score < item.cost) {
       return false;
     }
-    hasRegenUpgrade = true;
+    regenUpgradeLevel += 1;
     regenTickTimer = 1;
-    playPickupSound();
+    player.score -= item.cost;
+    playShopBuySound();
     return true;
   }
 
-  if (hasAttackSpeedUpgrade || player.score < item.cost) {
+  if (player.score < item.cost) {
     return false;
   }
-  hasAttackSpeedUpgrade = true;
-  playPickupSound();
+  attackSpeedUpgradeLevel += 1;
+  player.score -= item.cost;
+  playShopBuySound();
   return true;
 }
 
@@ -2165,19 +2297,20 @@ function updateShopItems(player: Fighter) {
     const bought = tryBuyShopItemByTouch(player, item);
     if (bought) {
       shopItems.splice(index, 1);
+    } else if (shopDenySoundCooldown <= 0) {
+      playShopDeniedSound();
+      shopDenySoundCooldown = SHOP_DENY_SOUND_COOLDOWN;
     }
   }
 
-  if (shopItems.length === 0) {
-    ensureEnemyWavePresent();
-  }
 }
 
 function spawnOrbitingSwordWave() {
+  const swordCount = Math.max(1, ORBITAL_SWORD_COUNT * swordUpgradeLevel);
   orbitingSwords.length = 0;
-  for (let index = 0; index < ORBITAL_SWORD_COUNT; index += 1) {
+  for (let index = 0; index < swordCount; index += 1) {
     orbitingSwords.push({
-      angleOffset: (index / ORBITAL_SWORD_COUNT) * TAU,
+      angleOffset: (index / swordCount) * TAU,
       timer: ORBITAL_SWORD_DURATION,
       damageTick: 0
     });
@@ -2190,20 +2323,22 @@ function updateShopUpgrades(dt: number) {
     return;
   }
 
-  if (shopItems.length > 0) {
+  shopDenySoundCooldown = Math.max(0, shopDenySoundCooldown - dt);
+
+  if (shopPhaseActive && shopItems.length > 0) {
     updateShopItems(player);
   }
 
-  if (hasRegenUpgrade) {
+  if (regenUpgradeLevel > 0) {
     regenTickTimer -= dt;
     if (regenTickTimer <= 0) {
       const regenTicks = Math.floor(Math.abs(regenTickTimer) + 1);
-      player.hp = Math.min(player.maxHp, player.hp + REGEN_AMOUNT_PER_SECOND * regenTicks);
+      player.hp = Math.min(player.maxHp, player.hp + REGEN_AMOUNT_PER_SECOND * regenUpgradeLevel * regenTicks);
       regenTickTimer += regenTicks;
     }
   }
 
-  if (!hasSwordUpgrade) {
+  if (swordUpgradeLevel <= 0) {
     return;
   }
 
@@ -2213,6 +2348,7 @@ function updateShopUpgrades(dt: number) {
     swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   }
 
+  let slicedEnemy = false;
   for (const sword of orbitingSwords) {
     sword.timer -= dt;
     sword.damageTick -= dt;
@@ -2231,9 +2367,14 @@ function updateShopUpgrades(dt: number) {
         continue;
       }
       applyProjectileDamage(enemy, ORBITAL_SWORD_DAMAGE, player.x, player.y, 6, player);
+      slicedEnemy = true;
     }
 
     sword.damageTick = ORBITAL_SWORD_DAMAGE_TICK;
+  }
+
+  if (slicedEnemy) {
+    playTone("triangle", 420, 0.035, 0.008, 560);
   }
 
   for (let index = orbitingSwords.length - 1; index >= 0; index -= 1) {
@@ -2298,11 +2439,13 @@ function updateShieldPickups(dt: number) {
   }
 }
 
-function updateStars(dt: number) {
-  starCooldown -= dt;
-  if (starCooldown <= 0) {
-    spawnStar();
-    starCooldown = 10 + Math.random() * 6;
+function updateStars(dt: number, allowAutoSpawn = true) {
+  if (allowAutoSpawn) {
+    starCooldown -= dt;
+    if (starCooldown <= 0) {
+      spawnStar();
+      starCooldown = 10 + Math.random() * 6;
+    }
   }
 
   const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
@@ -2335,6 +2478,7 @@ function updateStars(dt: number) {
 }
 
 function spawnLightningStrike() {
+  playTone("sine", 980, 0.04, 0.01, 760);
   lightningStrikes.push({
     x: 28 + Math.random() * (WORLD_WIDTH - 56),
     timer: 0.65,
@@ -2400,6 +2544,7 @@ function updateLightning(dt: number, allowAutoSpawn = true) {
 }
 
 function spawnMeteor() {
+  playTone("triangle", 170, 0.05, 0.012, 130);
   meteors.push({
     x: 32 + Math.random() * (WORLD_WIDTH - 64),
     y: 32 + Math.random() * (WORLD_HEIGHT - 64),
@@ -2524,13 +2669,14 @@ function updateMeteors(dt: number, allowAutoSpawn = true) {
 function update(dt: number) {
   elapsed += dt;
   let shouldResetRoster = false;
+  const shopActive = shopPhaseActive;
   const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
 
-  if (player) {
+  if (player && !shopActive) {
     survivalWithoutDeath += dt;
   }
 
-  if (player && !bossFightStarted && !bossFightWon) {
+  if (player && !shopActive && !bossFightStarted && !bossFightWon) {
     if (bossesDefeated === 0 && survivalWithoutDeath >= 60) {
       startBossFight("iron");
     } else if (bossesDefeated === 1 && survivalWithoutDeath >= 120) {
@@ -2581,7 +2727,6 @@ function update(dt: number) {
   updateExplosions(dt);
   updateShopUpgrades(dt);
   const activeBoss = getBoss();
-  const shopActive = shopItems.length > 0;
   if (!bossFightStarted) {
     updateLightning(dt, !shopActive);
     updateMeteors(dt, !shopActive);
@@ -2589,8 +2734,8 @@ function update(dt: number) {
     if (!shopActive) {
       updateMedkits(dt);
       updateShieldPickups(dt);
-      updateStars(dt);
     }
+    updateStars(dt, !shopActive);
   } else if (activeBoss?.bossKind === "skull") {
     updateLightning(dt, false);
     updateMeteors(dt, false);
@@ -3088,7 +3233,7 @@ function drawStars() {
 }
 
 function drawShop() {
-  if (shopItems.length === 0) {
+  if (!shopPhaseActive || shopItems.length === 0) {
     return;
   }
 
@@ -3104,6 +3249,22 @@ function drawShop() {
     ctx.fillText(label, item.x - 10, item.y - 12);
     ctx.fillText(`${item.cost}K`, item.x - 9, item.y + 2.5);
   }
+}
+
+function drawShopReadyButton() {
+  if (!shopPhaseActive) {
+    return;
+  }
+
+  const rect = getShopReadyButtonRect();
+  ctx.fillStyle = "rgba(95, 193, 255, 0.92)";
+  ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+  ctx.strokeStyle = "#dff6ff";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
+  ctx.fillStyle = "#102234";
+  ctx.font = "bold 9px monospace";
+  ctx.fillText("READY", rect.x + rect.width / 2 - 13, rect.y + 11);
 }
 
 function drawOrbitingSwords() {
@@ -3234,8 +3395,6 @@ function drawHud() {
   }
 
   const unlockedWeapons = getUnlockedWeapons(player.score);
-  const minutes = Math.floor(survivalWithoutDeath / 60);
-  const seconds = Math.floor(survivalWithoutDeath % 60);
   const progressBar = getProgressBarState();
   const progressX = 8;
   const progressY = 4;
@@ -3266,36 +3425,65 @@ function drawHud() {
   ctx.stroke();
 
   ctx.fillStyle = "#fff1da";
-  ctx.font = "bold 7px monospace";
+  ctx.font = 'bold 8px "Courier New", monospace';
   ctx.fillText(progressBar.label, progressX + 5, progressY + 8);
   ctx.fillText("15", milestone15 - 5, progressY + 18);
   ctx.fillText("30", milestone30 - 5, progressY + 18);
   ctx.fillText("45", milestone45 - 5, progressY + 18);
   ctx.fillText("60", milestone60 - 5, progressY + 18);
 
-  ctx.fillStyle = "rgba(14, 16, 24, 0.72)";
-  ctx.fillRect(8, 24, 126, 106);
-
-  ctx.fillStyle = "#f5e7c8";
-  ctx.font = "bold 8px monospace";
-  ctx.fillText(`HP ${Math.ceil(player.hp)}`, 14, 34);
-  ctx.fillText(`Score ${player.score}`, 14, 44);
-  ctx.fillText(getActivePlayerWeapon(player).toUpperCase(), 14, 54);
-  ctx.fillText(`CRIT ${Math.round(player.critChance * 100)}%`, 14, 64);
-  ctx.fillText(`DMG x${player.damageMultiplier.toFixed(1)}`, 14, 74);
-  ctx.fillText(`SHLD ${player.shieldCount}`, 14, 84);
-  ctx.fillText(`RAGE ${Math.round(player.rageCharge)}%`, 14, 94);
-  ctx.fillText(`TIME ${minutes}:${seconds.toString().padStart(2, "0")}`, 14, 104);
-  ctx.fillText(getPhaseLabel(), 14, 114);
-
-  if (player.shieldTimer > 0) {
-    ctx.fillStyle = "rgba(95, 193, 255, 0.3)";
-    ctx.fillRect(142, 24, 70, 12);
-    ctx.fillStyle = "#dff6ff";
-    ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, 146, 34);
+  const attackSpeedFactor = Math.pow(PLAYER_ATTACK_SPEED_MULTIPLIER, attackSpeedUpgradeLevel);
+  const hudX = 8;
+  const hudY = 24;
+  const hudLineStep = 9;
+  const hudPadX = 4;
+  const hudPadTop = 3;
+  const hudPadBottom = 4;
+  const hudTextX = hudX + hudPadX;
+  const hudLines = [
+    `HP ${Math.round((player.hp / player.maxHp) * 100)}%`,
+    `Score ${player.score}`,
+    `Crit ${Math.round(player.critChance * 100)}%`,
+    `Damage X${player.damageMultiplier.toFixed(1)}`,
+    `Shields ${player.shieldCount}`
+  ];
+  if (swordUpgradeLevel > 0) {
+    hudLines.push(`Sword Orbit Lv ${swordUpgradeLevel}`);
+  }
+  if (regenUpgradeLevel > 0) {
+    hudLines.push(`Regen +${REGEN_AMOUNT_PER_SECOND * regenUpgradeLevel} HP/s`);
+  }
+  if (attackSpeedUpgradeLevel > 0) {
+    hudLines.push(`Attack Speed x${attackSpeedFactor.toFixed(2)}`);
   }
 
-  const rageRect = touchControls.enabled ? getMobileRageButtonRect() : { x: 142, y: 40, width: 70, height: 12 };
+  ctx.font = 'bold 8px "Courier New", monospace';
+  const longestLineWidth = hudLines.reduce((maxWidth, line) => Math.max(maxWidth, ctx.measureText(line).width), 0);
+  const hudWidth = Math.ceil(longestLineWidth + hudPadX * 2);
+  const hudHeight = Math.ceil(hudPadTop + hudPadBottom + hudLines.length * hudLineStep);
+
+  ctx.fillStyle = "rgba(14, 16, 24, 0.72)";
+  ctx.fillRect(hudX, hudY, hudWidth, hudHeight);
+  ctx.fillStyle = "#f5e7c8";
+  let lineY = hudY + hudPadTop + 6;
+  for (const line of hudLines) {
+    ctx.fillText(line, hudTextX, lineY);
+    lineY += hudLineStep;
+  }
+
+  const rageRect = touchControls.enabled
+    ? getMobileRageButtonRect()
+    : { x: hudX + hudWidth + 6, y: hudY, width: 70, height: 12 };
+  const shieldRect = touchControls.enabled
+    ? { x: 142, y: 24, width: 70, height: 12 }
+    : { x: rageRect.x, y: rageRect.y + rageRect.height + 4, width: 78, height: 12 };
+  if (player.shieldTimer > 0) {
+    ctx.fillStyle = "rgba(95, 193, 255, 0.3)";
+    ctx.fillRect(shieldRect.x, shieldRect.y, shieldRect.width, shieldRect.height);
+    ctx.fillStyle = "#dff6ff";
+    ctx.fillText(`SHIELD ${player.shieldTimer.toFixed(1)}s`, shieldRect.x + 4, shieldRect.y + 10);
+  }
+
   ctx.fillStyle = "rgba(255, 110, 90, 0.22)";
   ctx.fillRect(rageRect.x, rageRect.y, rageRect.width, rageRect.height);
   ctx.fillStyle = "rgba(255, 110, 90, 0.82)";
@@ -3316,14 +3504,15 @@ function drawHud() {
       rageRect.y + 7
     );
   } else {
+    ctx.font = "bold 7px monospace";
     ctx.fillText(
       player.rageTimer > 0
         ? `RAGE ${player.rageTimer.toFixed(1)}s`
         : player.rageCooldown > 0
           ? `CD ${player.rageCooldown.toFixed(1)}s`
           : "SPACE RAGE",
-      146,
-      50
+      rageRect.x + 4,
+      rageRect.y + 9
     );
   }
 
@@ -3360,12 +3549,12 @@ function drawHud() {
     ctx.fillText(`RESPAWN ${player.respawn.toFixed(1)}s`, WORLD_WIDTH / 2 - 58, WORLD_HEIGHT / 2 + 3);
   }
 
-  if (shopItems.length > 0 && player.respawn <= 0) {
+  if (shopPhaseActive && player.respawn <= 0) {
     ctx.fillStyle = "rgba(12, 16, 22, 0.8)";
-    ctx.fillRect(WORLD_WIDTH - 126, 58, 118, 14);
+    ctx.fillRect(WORLD_WIDTH - 156, 58, 148, 14);
     ctx.fillStyle = "#ffe8b2";
     ctx.font = "bold 7px monospace";
-    ctx.fillText("TOUCH SHOP ITEMS", WORLD_WIDTH - 121, 67);
+    ctx.fillText("TOUCH ITEMS OR PRESS READY", WORLD_WIDTH - 151, 67);
   }
 }
 
@@ -3504,6 +3693,7 @@ function render() {
   drawHud();
   drawBossHud();
   drawTouchControls();
+  drawShopReadyButton();
   drawPauseOverlay();
 }
 
@@ -3666,6 +3856,14 @@ function handleTouchPress(clientX: number, clientY: number) {
     return true;
   }
 
+  if (shopPhaseActive) {
+    const readyRect = getShopReadyButtonRect();
+    if (isInsideRect(point.x, point.y, readyRect.x, readyRect.y, readyRect.width, readyRect.height)) {
+      endShopPhase();
+      return true;
+    }
+  }
+
   if (touchControls.enabled) {
     const rageRect = getMobileRageButtonRect();
     if (isInsideRect(point.x, point.y, rageRect.x, rageRect.y, rageRect.width, rageRect.height)) {
@@ -3710,6 +3908,16 @@ window.addEventListener("keydown", (event) => {
     const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
     if (devInfiniteHealth && player) {
       player.hp = player.maxHp;
+    }
+    event.preventDefault();
+    return;
+  }
+
+  if (event.key === "+" || event.code === "NumpadAdd") {
+    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    if (player) {
+      player.score += DEBUG_SHOP_POINTS_BONUS;
+      playPickupSound();
     }
     event.preventDefault();
     return;
@@ -3790,6 +3998,14 @@ canvas.addEventListener("mousedown", (event) => {
       showRulesMenu = true;
     }
     return;
+  }
+
+  if (shopPhaseActive) {
+    const readyRect = getShopReadyButtonRect();
+    if (isInsideRect(input.mouseX, input.mouseY, readyRect.x, readyRect.y, readyRect.width, readyRect.height)) {
+      endShopPhase();
+      return;
+    }
   }
 
   input.shoot = true;
@@ -3887,9 +4103,10 @@ function saveRuntimeSnapshot() {
     shieldPickups: structuredClone(shieldPickups),
     explosions: structuredClone(explosions),
     shopItems: structuredClone(shopItems),
-    hasSwordUpgrade,
-    hasRegenUpgrade,
-    hasAttackSpeedUpgrade,
+    shopPhaseActive,
+    swordUpgradeLevel,
+    regenUpgradeLevel,
+    attackSpeedUpgradeLevel,
     swordSpawnTimer,
     regenTickTimer,
     orbitingSwords: structuredClone(orbitingSwords),
@@ -3963,9 +4180,10 @@ function restoreRuntimeSnapshot() {
     explosions.push(...snapshot.explosions);
     shopItems.length = 0;
     shopItems.push(...(snapshot.shopItems ?? []));
-    hasSwordUpgrade = snapshot.hasSwordUpgrade ?? false;
-    hasRegenUpgrade = snapshot.hasRegenUpgrade ?? false;
-    hasAttackSpeedUpgrade = snapshot.hasAttackSpeedUpgrade ?? false;
+    shopPhaseActive = snapshot.shopPhaseActive ?? shopItems.length > 0;
+    swordUpgradeLevel = snapshot.swordUpgradeLevel ?? (snapshot.hasSwordUpgrade ? 1 : 0);
+    regenUpgradeLevel = snapshot.regenUpgradeLevel ?? (snapshot.hasRegenUpgrade ? 1 : 0);
+    attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel ?? (snapshot.hasAttackSpeedUpgrade ? 1 : 0);
     swordSpawnTimer = snapshot.swordSpawnTimer ?? ORBITAL_SWORD_SPAWN_INTERVAL;
     regenTickTimer = snapshot.regenTickTimer ?? 1;
     orbitingSwords.length = 0;
