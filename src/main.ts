@@ -23,6 +23,18 @@ const BOSS1_SHIELD_LINE_WIDTH = 3;
 const SKULL_BOSS_PROJECTILE_WINDUP = 0.05;
 const MAX_SIMULTANEOUS_ENEMIES = 15;
 const NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE = 0.5;
+const SHOP_ITEM_COST_SWORDS = 20;
+const SHOP_ITEM_COST_REGEN = 20;
+const SHOP_ITEM_COST_ATTACK_SPEED = 30;
+const PLAYER_ATTACK_SPEED_MULTIPLIER = 1.25;
+const ORBITAL_SWORD_SPAWN_INTERVAL = 10;
+const ORBITAL_SWORD_DURATION = 3.5;
+const ORBITAL_SWORD_COUNT = 3;
+const ORBITAL_SWORD_RADIUS = 22;
+const ORBITAL_SWORD_SPIN_SPEED = 5.4;
+const ORBITAL_SWORD_DAMAGE = 30;
+const ORBITAL_SWORD_DAMAGE_TICK = 0.25;
+const REGEN_AMOUNT_PER_SECOND = 3;
 const LIVE_RELOAD_STATE_KEY = "pixel-bot-brawler:dev-state";
 const AudioContextClass = window.AudioContext || (window as typeof window & {
   webkitAudioContext?: typeof AudioContext;
@@ -147,6 +159,19 @@ type Explosion = {
   maxTimer: number;
 };
 
+type ShopItem = {
+  x: number;
+  y: number;
+  itemType: "swords" | "regen" | "attackSpeed";
+  cost: number;
+};
+
+type OrbitingSword = {
+  angleOffset: number;
+  timer: number;
+  damageTick: number;
+};
+
 type BossKind = "none" | "iron" | "skull";
 type BossAttackType = "targeted" | "forward" | "left" | "right";
 type RuntimeSnapshot = {
@@ -159,6 +184,13 @@ type RuntimeSnapshot = {
   stars: StarPickup[];
   shieldPickups: ShieldPickup[];
   explosions: Explosion[];
+  shopItems: ShopItem[];
+  hasSwordUpgrade: boolean;
+  hasRegenUpgrade: boolean;
+  hasAttackSpeedUpgrade: boolean;
+  swordSpawnTimer: number;
+  regenTickTimer: number;
+  orbitingSwords: OrbitingSword[];
   nextId: number;
   elapsed: number;
   lightningCooldown: number;
@@ -240,6 +272,13 @@ const stars: StarPickup[] = [];
 let shieldPickupCooldown = 18;
 const shieldPickups: ShieldPickup[] = [];
 const explosions: Explosion[] = [];
+const shopItems: ShopItem[] = [];
+let hasSwordUpgrade = false;
+let hasRegenUpgrade = false;
+let hasAttackSpeedUpgrade = false;
+let swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
+let regenTickTimer = 1;
+const orbitingSwords: OrbitingSword[] = [];
 const weaponOrder: WeaponType[] = ["pistol", "smg", "shotgun", "rifle", "bazooka"];
 let selectedWeapon: WeaponType = "pistol";
 let highestUnlockedWeapon: WeaponType = "pistol";
@@ -464,6 +503,13 @@ function spawnRoster() {
   stars.length = 0;
   shieldPickups.length = 0;
   explosions.length = 0;
+  orbitingSwords.length = 0;
+  shopItems.length = 0;
+  hasSwordUpgrade = false;
+  hasRegenUpgrade = false;
+  hasAttackSpeedUpgrade = false;
+  swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
+  regenTickTimer = 1;
   lightningCooldown = 2.4;
   meteorCooldown = 5.2;
   medkitCooldown = 4.5;
@@ -545,7 +591,7 @@ function playerHasInfiniteHealth(target: Fighter) {
 
 function ensureEnemyWavePresent() {
   const activeEnemies = fighters.some((fighter) => fighter.team === "enemy" && fighter.respawn <= 0);
-  if (!activeEnemies && !bossFightStarted) {
+  if (!activeEnemies && !bossFightStarted && shopItems.length === 0) {
     spawnEnemyWave();
   }
 }
@@ -556,6 +602,13 @@ function applyDevStage(stageIndex: number) {
 
   clearAmbientHazards();
   despawnEnemies();
+  orbitingSwords.length = 0;
+  shopItems.length = 0;
+  hasSwordUpgrade = false;
+  hasRegenUpgrade = false;
+  hasAttackSpeedUpgrade = false;
+  swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
+  regenTickTimer = 1;
   survivalWithoutDeath = snapshot.survival;
   bossesDefeated = snapshot.bossesDefeated;
   bossFightStarted = false;
@@ -1028,19 +1081,20 @@ function shoot(fighter: Fighter) {
     const rageReloadFactor = fighter.rageTimer > 0 ? 0.45 : 1;
     const rageSpeedFactor = fighter.rageTimer > 0 ? 2 : 1;
     const playerSpeedFactor = 1.5;
+    const attackSpeedFactor = hasAttackSpeedUpgrade ? PLAYER_ATTACK_SPEED_MULTIPLIER : 1;
 
     if (weapon === "pistol") {
-      fighter.reload = 0.2 * rageReloadFactor;
+      fighter.reload = (0.2 * rageReloadFactor) / attackSpeedFactor;
       createBullet(fighter, fighter.dir, 176 * playerSpeedFactor * rageSpeedFactor, 10, 24, 3, weapon);
     } else if (weapon === "shotgun") {
-      fighter.reload = 0.28 * rageReloadFactor;
+      fighter.reload = (0.28 * rageReloadFactor) / attackSpeedFactor;
       createBullet(fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
       createBullet(fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
       createBullet(fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
       createBullet(fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
       createBullet(fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
     } else if (weapon === "smg") {
-      fighter.reload = 0.06 * rageReloadFactor;
+      fighter.reload = (0.06 * rageReloadFactor) / attackSpeedFactor;
       createBullet(
         fighter,
         fighter.dir + (Math.random() - 0.5) * 0.12,
@@ -1051,10 +1105,10 @@ function shoot(fighter: Fighter) {
         weapon
       );
     } else if (weapon === "rifle") {
-      fighter.reload = 0.08 * rageReloadFactor;
+      fighter.reload = (0.08 * rageReloadFactor) / attackSpeedFactor;
       createBullet(fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon);
     } else {
-      fighter.reload = 0.275 * rageReloadFactor;
+      fighter.reload = (0.275 * rageReloadFactor) / attackSpeedFactor;
       createBullet(fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon);
     }
   } else {
@@ -1676,6 +1730,13 @@ function clearRunStateOnPlayerDeath() {
   stars.length = 0;
   shieldPickups.length = 0;
   explosions.length = 0;
+  orbitingSwords.length = 0;
+  shopItems.length = 0;
+  hasSwordUpgrade = false;
+  hasRegenUpgrade = false;
+  hasAttackSpeedUpgrade = false;
+  swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
+  regenTickTimer = 1;
   survivalWithoutDeath = 0;
   bossFightStarted = false;
   bossFightWon = false;
@@ -1699,6 +1760,46 @@ function clearRunStateOnPlayerDeath() {
     if (fighters[i].team === "ally") {
       fighters.splice(i, 1);
     }
+  }
+}
+
+function spawnShopItems() {
+  shopItems.length = 0;
+  const laneY = WORLD_HEIGHT / 2;
+  const candidates: Array<ShopItem> = [
+    {
+      x: WORLD_WIDTH * 0.2,
+      y: laneY,
+      itemType: "swords",
+      cost: SHOP_ITEM_COST_SWORDS
+    },
+    {
+      x: WORLD_WIDTH * 0.5,
+      y: laneY,
+      itemType: "regen",
+      cost: SHOP_ITEM_COST_REGEN
+    },
+    {
+      x: WORLD_WIDTH * 0.8,
+      y: laneY,
+      itemType: "attackSpeed",
+      cost: SHOP_ITEM_COST_ATTACK_SPEED
+    }
+  ];
+
+  for (const item of candidates) {
+    const alreadyOwned =
+      (item.itemType === "swords" && hasSwordUpgrade) ||
+      (item.itemType === "regen" && hasRegenUpgrade) ||
+      (item.itemType === "attackSpeed" && hasAttackSpeedUpgrade);
+    if (alreadyOwned) {
+      continue;
+    }
+    shopItems.push({
+      ...item,
+      x: clamp(item.x, 18, WORLD_WIDTH - 18),
+      y: clamp(item.y, 18, WORLD_HEIGHT - 18)
+    });
   }
 }
 
@@ -1734,10 +1835,9 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
     skullBossBurstShotsLeft = 0;
     skullBossBurstWindup = 0;
     bossesDefeated += 1;
+    despawnEnemies();
     clearAmbientHazards();
-    if (defeatedBossKind !== "skull") {
-      spawnEnemyWave();
-    }
+    spawnShopItems();
     spawnBossBlueStars(bossDeathX, bossDeathY);
     if (owner) {
       owner.score += defeatedBossKind === "skull" ? 14 : 10;
@@ -2024,6 +2124,122 @@ function spawnBossBlueStars(centerX: number, centerY: number) {
       y,
       color: "blue"
     });
+  }
+}
+
+function tryBuyShopItemByTouch(player: Fighter, item: ShopItem) {
+  if (item.itemType === "swords") {
+    if (hasSwordUpgrade || player.score < item.cost) {
+      return false;
+    }
+    hasSwordUpgrade = true;
+    swordSpawnTimer = 0;
+    playPickupSound();
+    return true;
+  }
+
+  if (item.itemType === "regen") {
+    if (hasRegenUpgrade || player.score < item.cost) {
+      return false;
+    }
+    hasRegenUpgrade = true;
+    regenTickTimer = 1;
+    playPickupSound();
+    return true;
+  }
+
+  if (hasAttackSpeedUpgrade || player.score < item.cost) {
+    return false;
+  }
+  hasAttackSpeedUpgrade = true;
+  playPickupSound();
+  return true;
+}
+
+function updateShopItems(player: Fighter) {
+  for (let index = shopItems.length - 1; index >= 0; index -= 1) {
+    const item = shopItems[index];
+    if (Math.hypot(player.x - item.x, player.y - item.y) > player.radius + 9) {
+      continue;
+    }
+    const bought = tryBuyShopItemByTouch(player, item);
+    if (bought) {
+      shopItems.splice(index, 1);
+    }
+  }
+
+  if (shopItems.length === 0) {
+    ensureEnemyWavePresent();
+  }
+}
+
+function spawnOrbitingSwordWave() {
+  orbitingSwords.length = 0;
+  for (let index = 0; index < ORBITAL_SWORD_COUNT; index += 1) {
+    orbitingSwords.push({
+      angleOffset: (index / ORBITAL_SWORD_COUNT) * TAU,
+      timer: ORBITAL_SWORD_DURATION,
+      damageTick: 0
+    });
+  }
+}
+
+function updateShopUpgrades(dt: number) {
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  if (!player) {
+    return;
+  }
+
+  if (shopItems.length > 0) {
+    updateShopItems(player);
+  }
+
+  if (hasRegenUpgrade) {
+    regenTickTimer -= dt;
+    if (regenTickTimer <= 0) {
+      const regenTicks = Math.floor(Math.abs(regenTickTimer) + 1);
+      player.hp = Math.min(player.maxHp, player.hp + REGEN_AMOUNT_PER_SECOND * regenTicks);
+      regenTickTimer += regenTicks;
+    }
+  }
+
+  if (!hasSwordUpgrade) {
+    return;
+  }
+
+  swordSpawnTimer -= dt;
+  if (swordSpawnTimer <= 0) {
+    spawnOrbitingSwordWave();
+    swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
+  }
+
+  for (const sword of orbitingSwords) {
+    sword.timer -= dt;
+    sword.damageTick -= dt;
+    if (sword.damageTick > 0) {
+      continue;
+    }
+
+    const angle = elapsed * ORBITAL_SWORD_SPIN_SPEED + sword.angleOffset;
+    const swordX = player.x + Math.cos(angle) * ORBITAL_SWORD_RADIUS;
+    const swordY = player.y + Math.sin(angle) * ORBITAL_SWORD_RADIUS;
+    for (const enemy of fighters) {
+      if (enemy.team !== "enemy" || enemy.respawn > 0) {
+        continue;
+      }
+      if (Math.hypot(enemy.x - swordX, enemy.y - swordY) > enemy.radius + 6) {
+        continue;
+      }
+      applyProjectileDamage(enemy, ORBITAL_SWORD_DAMAGE, player.x, player.y, 6, player);
+    }
+
+    sword.damageTick = ORBITAL_SWORD_DAMAGE_TICK;
+  }
+
+  for (let index = orbitingSwords.length - 1; index >= 0; index -= 1) {
+    if (orbitingSwords[index].timer <= 0) {
+      orbitingSwords.splice(index, 1);
+    }
   }
 }
 
@@ -2363,14 +2579,18 @@ function update(dt: number) {
 
   updateBullets(dt);
   updateExplosions(dt);
+  updateShopUpgrades(dt);
   const activeBoss = getBoss();
+  const shopActive = shopItems.length > 0;
   if (!bossFightStarted) {
-    updateLightning(dt);
-    updateMeteors(dt);
+    updateLightning(dt, !shopActive);
+    updateMeteors(dt, !shopActive);
     updateBurningFloors(dt);
-    updateMedkits(dt);
-    updateShieldPickups(dt);
-    updateStars(dt);
+    if (!shopActive) {
+      updateMedkits(dt);
+      updateShieldPickups(dt);
+      updateStars(dt);
+    }
   } else if (activeBoss?.bossKind === "skull") {
     updateLightning(dt, false);
     updateMeteors(dt, false);
@@ -2867,6 +3087,56 @@ function drawStars() {
   }
 }
 
+function drawShop() {
+  if (shopItems.length === 0) {
+    return;
+  }
+
+  for (const item of shopItems) {
+    const label = item.itemType === "swords" ? "SWORD" : item.itemType === "regen" ? "REGEN" : "ATK";
+    ctx.fillStyle = "rgba(18, 24, 38, 0.92)";
+    ctx.fillRect(item.x - 12, item.y - 8, 24, 16);
+    ctx.strokeStyle = "#f7d88a";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(item.x - 12, item.y - 8, 24, 16);
+    ctx.fillStyle = "#ffe9ad";
+    ctx.font = "bold 7px monospace";
+    ctx.fillText(label, item.x - 10, item.y - 12);
+    ctx.fillText(`${item.cost}K`, item.x - 9, item.y + 2.5);
+  }
+}
+
+function drawOrbitingSwords() {
+  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  if (!player || orbitingSwords.length <= 0) {
+    return;
+  }
+
+  for (const sword of orbitingSwords) {
+    const angle = elapsed * ORBITAL_SWORD_SPIN_SPEED + sword.angleOffset;
+    const swordX = player.x + Math.cos(angle) * ORBITAL_SWORD_RADIUS;
+    const swordY = player.y + Math.sin(angle) * ORBITAL_SWORD_RADIUS;
+    const tipX = swordX + Math.cos(angle) * 8;
+    const tipY = swordY + Math.sin(angle) * 8;
+    const tailX = swordX - Math.cos(angle) * 4;
+    const tailY = swordY - Math.sin(angle) * 4;
+
+    ctx.strokeStyle = "#f0f4ff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(tailX, tailY);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#a9b4c7";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(swordX, swordY);
+    ctx.lineTo(tailX, tailY);
+    ctx.stroke();
+  }
+}
+
 function drawExplosions() {
   for (const explosion of explosions) {
     const progress = explosion.timer / explosion.maxTimer;
@@ -3089,6 +3359,14 @@ function drawHud() {
     ctx.font = "bold 10px monospace";
     ctx.fillText(`RESPAWN ${player.respawn.toFixed(1)}s`, WORLD_WIDTH / 2 - 58, WORLD_HEIGHT / 2 + 3);
   }
+
+  if (shopItems.length > 0 && player.respawn <= 0) {
+    ctx.fillStyle = "rgba(12, 16, 22, 0.8)";
+    ctx.fillRect(WORLD_WIDTH - 126, 58, 118, 14);
+    ctx.fillStyle = "#ffe8b2";
+    ctx.font = "bold 7px monospace";
+    ctx.fillText("TOUCH SHOP ITEMS", WORLD_WIDTH - 121, 67);
+  }
 }
 
 function drawPauseOverlay() {
@@ -3214,6 +3492,7 @@ function render() {
   drawMedkits();
   drawShieldPickups();
   drawStars();
+  drawShop();
   drawBullets();
   drawExplosions();
   drawLightning();
@@ -3221,6 +3500,7 @@ function render() {
   drawBurningFloors();
   drawBossTelegraphs();
   fighters.forEach(drawFighter);
+  drawOrbitingSwords();
   drawHud();
   drawBossHud();
   drawTouchControls();
@@ -3606,6 +3886,13 @@ function saveRuntimeSnapshot() {
     stars: structuredClone(stars),
     shieldPickups: structuredClone(shieldPickups),
     explosions: structuredClone(explosions),
+    shopItems: structuredClone(shopItems),
+    hasSwordUpgrade,
+    hasRegenUpgrade,
+    hasAttackSpeedUpgrade,
+    swordSpawnTimer,
+    regenTickTimer,
+    orbitingSwords: structuredClone(orbitingSwords),
     nextId,
     elapsed,
     lightningCooldown,
@@ -3674,6 +3961,15 @@ function restoreRuntimeSnapshot() {
     shieldPickups.push(...snapshot.shieldPickups);
     explosions.length = 0;
     explosions.push(...snapshot.explosions);
+    shopItems.length = 0;
+    shopItems.push(...(snapshot.shopItems ?? []));
+    hasSwordUpgrade = snapshot.hasSwordUpgrade ?? false;
+    hasRegenUpgrade = snapshot.hasRegenUpgrade ?? false;
+    hasAttackSpeedUpgrade = snapshot.hasAttackSpeedUpgrade ?? false;
+    swordSpawnTimer = snapshot.swordSpawnTimer ?? ORBITAL_SWORD_SPAWN_INTERVAL;
+    regenTickTimer = snapshot.regenTickTimer ?? 1;
+    orbitingSwords.length = 0;
+    orbitingSwords.push(...(snapshot.orbitingSwords ?? []));
 
     nextId = snapshot.nextId;
     elapsed = snapshot.elapsed;
