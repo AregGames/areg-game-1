@@ -12,6 +12,7 @@ body {
   place-items: center;
   background:
     radial-gradient(circle at top, #b96b38 0%, #6b3d24 42%, #1f120d 100%);
+  font-family: "Courier New", monospace;
 }
 
 canvas {
@@ -24,4 +25,148 @@ canvas {
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: rgba(10, 8, 7, 0.58);
+  backdrop-filter: blur(10px);
+}
+
+.menu-panel {
+  width: min(460px, calc(100vw - 32px));
+  max-width: 100%;
+  margin: auto;
+  padding: 20px;
+  border: 1px solid rgba(255, 230, 186, 0.3);
+  background:
+    linear-gradient(180deg, rgba(47, 25, 16, 0.96), rgba(18, 12, 10, 0.94));
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+  color: #f7ead1;
+}
+
+.menu-kicker,
+.menu-panel h1,
+.menu-copy,
+.menu-label,
+.menu-status {
+  margin: 0;
+}
+
+.menu-kicker {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(255, 214, 158, 0.76);
+}
+
+.menu-panel h1 {
+  margin-top: 10px;
+  font-size: 24px;
+}
+
+.menu-copy {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(247, 234, 209, 0.82);
+}
+
+.menu-label {
+  display: block;
+  margin-top: 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.menu-textarea,
+.menu-status,
+.menu-actions button {
+  border: 1px solid rgba(255, 230, 186, 0.24);
+  background: rgba(30, 20, 16, 0.86);
+  color: inherit;
+  font: inherit;
+}
+
+.menu-textarea {
+  width: 100%;
+  min-height: 90px;
+  margin-top: 6px;
+  padding: 10px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.menu-textarea-copy {
+  cursor: copy;
+}
+
+.menu-status {
+  margin-top: 12px;
+  padding: 10px;
+  font-size: 12px;
+}
+
+.menu-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.menu-actions button {
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+.menu-actions button.ghost {
+  background: rgba(16, 10, 8, 0.8);
+}
+
+.menu-actions button:hover {
+  background: rgba(68, 42, 28, 0.95);
+}
+
+.menu-qr-wrap {
+  display: grid;
+  place-items: center;
+  margin-top: 12px;
+  min-height: 0;
+}
+
+.menu-qr {
+  width: min(220px, 100%);
+  aspect-ratio: 1;
+  background: #fff;
+}
+
+.menu-scanner {
+  margin-top: 12px;
+}
+
+.menu-scanner-video {
+  width: 100%;
+  border: 1px solid rgba(255, 230, 186, 0.24);
+  background: rgba(16, 10, 8, 0.9);
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+
+@media (max-width: 900px) {
+  .menu-panel {
+    width: min(100%, calc(100vw - 24px));
+    padding: 16px;
+  }
+
+  .menu-overlay {
+    place-items: start center;
+    padding: 12px;
+  }
 }

@@ -44,6 +44,14 @@ const LIVE_RELOAD_STATE_KEY = "pixel-bot-brawler:dev-state";
 const AudioContextClass = window.AudioContext || (window as typeof window & {
   webkitAudioContext?: typeof AudioContext;
 }).webkitAudioContext;
+type DetectedQrCode = { rawValue?: string };
+type QrDetectorInstance = {
+  detect: (source: ImageBitmapSource) => Promise<DetectedQrCode[]>;
+};
+type WindowWithQrDetector = typeof window & {
+  BarcodeDetector?: new (options?: { formats?: string[] }) => QrDetectorInstance;
+};
+const BarcodeDetectorClass = (window as WindowWithQrDetector).BarcodeDetector;
 
 canvas.width = WORLD_WIDTH;
 canvas.height = WORLD_HEIGHT;
@@ -85,6 +93,10 @@ type Fighter = {
   rageCooldown: number;
   isBoss: boolean;
   bossKind: BossKind;
+  controller: "local" | "remote" | "none";
+  playerSlot: 0 | 1 | null;
+  selectedWeapon: WeaponType;
+  highestUnlockedWeapon: WeaponType;
 };
 
 type Bullet = {
@@ -179,6 +191,50 @@ type OrbitingSword = {
 
 type BossKind = "none" | "iron" | "skull";
 type BossAttackType = "targeted" | "forward" | "left" | "right";
+type ControlState = {
+  up: boolean;
+  down: boolean;
+  left: boolean;
+  right: boolean;
+  moveX: number;
+  moveY: number;
+  shoot: boolean;
+  mouseX: number;
+  mouseY: number;
+};
+type ControlCommandState = {
+  weaponSlot: number | null;
+  shieldPressed: boolean;
+  ragePressed: boolean;
+};
+type MultiplayerRole = "solo" | "host" | "guest";
+type NetworkStatus =
+  | "offline"
+  | "preparing"
+  | "waiting-for-peer"
+  | "joining"
+  | "connecting"
+  | "connected"
+  | "error";
+type MenuScreen =
+  | "home"
+  | "friend"
+  | "host"
+  | "join"
+  | "guest-share"
+  | "relay-answer";
+type ScannerMode = "invite" | "reply" | null;
+type NetworkPacket =
+  | {
+      type: "input";
+      payload: ControlState & ControlCommandState & {
+        seq: number;
+      };
+    }
+  | {
+      type: "snapshot";
+      payload: RuntimeSnapshot;
+    };
 type RuntimeSnapshot = {
   fighters: Fighter[];
   bullets: Bullet[];
@@ -235,17 +291,32 @@ type RuntimeSnapshot = {
   bossesDefeated: number;
 };
 
-const input = {
-  up: false,
-  down: false,
-  left: false,
-  right: false,
-  moveX: 0,
-  moveY: 0,
-  shoot: false,
-  mouseX: WORLD_WIDTH / 2,
-  mouseY: WORLD_HEIGHT / 2
-};
+function createControlState(): ControlState {
+  return {
+    up: false,
+    down: false,
+    left: false,
+    right: false,
+    moveX: 0,
+    moveY: 0,
+    shoot: false,
+    mouseX: WORLD_WIDTH / 2,
+    mouseY: WORLD_HEIGHT / 2
+  };
+}
+
+function createControlCommandState(): ControlCommandState {
+  return {
+    weaponSlot: null,
+    shieldPressed: false,
+    ragePressed: false
+  };
+}
+
+const input = createControlState();
+const remoteInput = createControlState();
+const remoteCommands = createControlCommandState();
+const outgoingGuestCommands = createControlCommandState();
 
 const touchControls = {
   enabled: IS_MOBILE_VIEWPORT,
@@ -292,8 +363,6 @@ let swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
 let regenTickTimer = 1;
 const orbitingSwords: OrbitingSword[] = [];
 const weaponOrder: WeaponType[] = ["pistol", "smg", "shotgun", "rifle", "bazooka"];
-let selectedWeapon: WeaponType = "pistol";
-let highestUnlockedWeapon: WeaponType = "pistol";
 let isPaused = false;
 let showRulesMenu = false;
 let rulesScroll = 0;
@@ -321,6 +390,46 @@ let skullBossBurstWindup = 0;
 let bossesDefeated = 0;
 let liveReloadSaveTimer = 0;
 let shopDenySoundCooldown = 0;
+let multiplayerRole: MultiplayerRole = "solo";
+let networkStatus: NetworkStatus = "offline";
+let networkMessage = "Solo run";
+let peerConnection: RTCPeerConnection | null = null;
+let dataChannel: RTCDataChannel | null = null;
+let lastGuestInputSentAt = 0;
+let localInputSequence = 0;
+let snapshotBroadcastTimer = 0;
+let lastSnapshotReceivedAt = 0;
+let gameStarted = false;
+let menuOpen = true;
+let menuScreen: MenuScreen = "home";
+let pendingSessionId = "";
+let pendingShareLink = "";
+let pendingReturnLink = "";
+let qrImageUrl = "";
+let linkInputValue = "";
+let answerInputValue = "";
+let answerRelayChannel: BroadcastChannel | null = null;
+let connectionTimeoutId: number | null = null;
+let scannerMode: ScannerMode = null;
+let scannerError = "";
+let scannerBusy = false;
+let scannerAnimationFrameId = 0;
+let scannerStream: MediaStream | null = null;
+let scannerVideo: HTMLVideoElement | null = null;
+const SNAPSHOT_SEND_INTERVAL = 0.12;
+const GUEST_INPUT_SEND_INTERVAL = 0.05;
+const ANSWER_RELAY_KEY_PREFIX = "pixel-bot-brawler:p2p-answer:";
+const rtcConfiguration: RTCConfiguration = {
+  iceServers: [
+    {
+      urls: [
+        "stun:stun.l.google.com:19302",
+        "stun:stun1.l.google.com:19302",
+        "stun:stun2.l.google.com:19302"
+      ]
+    }
+  ]
+};
 
 const bossAttackPattern: BossAttackType[] = ["targeted", "targeted", "forward", "left", "right", "left", "left"];
 
@@ -364,6 +473,146 @@ const rulesLines = [
   "USE MOUSE WHEEL TO SCROLL THESE RULES."
 ];
 
+const menuOverlay = document.createElement("section");
+menuOverlay.className = "menu-overlay";
+document.body.append(menuOverlay);
+
+function updateQrImage(link: string) {
+  qrImageUrl = link
+    ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`
+    : "";
+}
+
+function getScannerMarkup(mode: ScannerMode) {
+  if (scannerMode !== mode) {
+    return "";
+  }
+
+  return `
+    <div class="menu-scanner">
+      <video id="menu-scanner-video" class="menu-scanner-video" autoplay playsinline muted></video>
+      <div class="menu-status">${scannerError || "Point the camera at the QR code."}</div>
+      <div class="menu-actions">
+        <button type="button" data-action="stop-scan" class="ghost">Stop Scanning</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderMenu() {
+  menuOverlay.hidden = !menuOpen;
+  menuOverlay.style.display = menuOpen ? "grid" : "none";
+
+  const qrMarkup = qrImageUrl
+    ? `<img class="menu-qr" src="${qrImageUrl}" alt="QR code for multiplayer link" referrerpolicy="no-referrer">`
+    : "";
+
+  if (menuScreen === "home") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Pixel Bot Brawler</p>
+        <h1>Choose a mode</h1>
+        <p class="menu-copy">Fight solo or open a friend room with a shareable link.</p>
+        <div class="menu-actions">
+          ${gameStarted ? '<button type="button" data-action="resume-game">Resume</button>' : ""}
+          <button type="button" data-action="new-game">New Game</button>
+          <button type="button" data-action="play-friend">Play with Friend</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  if (menuScreen === "friend") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Play with Friend</p>
+        <h1>Host or join</h1>
+        <p class="menu-copy">Create a room and share the invite, or open a link your friend sent you.</p>
+        <div class="menu-status">${networkMessage}</div>
+        <div class="menu-actions">
+          <button type="button" data-action="create-room">Create Game</button>
+          <button type="button" data-action="show-join">Join Game</button>
+          <button type="button" data-action="back-home" class="ghost">Back</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  if (menuScreen === "join") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Join Game</p>
+        <h1>Open your friend's invite</h1>
+        <p class="menu-copy">Scan the invite QR or paste the link here. If you opened the page from a shared link, this can happen automatically.</p>
+        <label class="menu-label" for="menu-link-input">Invite Link</label>
+        <textarea id="menu-link-input" class="menu-textarea" spellcheck="false" placeholder="https://...">${linkInputValue}</textarea>
+        <div class="menu-status">${networkMessage}</div>
+        <div class="menu-actions">
+          <button type="button" data-action="join-link">Join</button>
+          <button type="button" data-action="scan-invite" ${scannerBusy ? "disabled" : ""}>Scan Invite QR</button>
+          <button type="button" data-action="back-friend" class="ghost">Back</button>
+        </div>
+        ${getScannerMarkup("invite")}
+      </div>
+    `;
+    return;
+  }
+
+  if (menuScreen === "host") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Create Game</p>
+        <h1>Share this invite</h1>
+        <p class="menu-copy">Send the link or let your friend scan the QR. Then scan their reply QR here, or paste the reply link if the camera is awkward.</p>
+        <label class="menu-label" for="menu-share-link">Invite Link</label>
+        <textarea id="menu-share-link" class="menu-textarea menu-textarea-copy" readonly data-copy-value="${pendingShareLink}" placeholder="Generating invite link...">${pendingShareLink}</textarea>
+        <div class="menu-qr-wrap">${qrMarkup}</div>
+        <label class="menu-label" for="menu-answer-input">Guest Reply Link</label>
+        <textarea id="menu-answer-input" class="menu-textarea" spellcheck="false" placeholder="Scan the guest reply QR or paste the reply link here.">${answerInputValue}</textarea>
+        <div class="menu-status">${networkMessage}</div>
+        <div class="menu-actions">
+          <button type="button" data-action="connect-reply">Connect Reply</button>
+          <button type="button" data-action="scan-reply" ${scannerBusy ? "disabled" : ""}>Scan Guest Reply</button>
+          <button type="button" data-action="cancel-room" class="ghost">Cancel</button>
+        </div>
+        ${getScannerMarkup("reply")}
+      </div>
+    `;
+    return;
+  }
+
+  if (menuScreen === "guest-share") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Almost There</p>
+        <h1>Send this back to the host</h1>
+        <p class="menu-copy">Let the host scan this QR, or send them the short reply link so they can paste it into the host screen.</p>
+        <label class="menu-label" for="menu-return-link">Return Link</label>
+        <textarea id="menu-return-link" class="menu-textarea menu-textarea-copy" readonly data-copy-value="${pendingReturnLink}" placeholder="Generating reply link...">${pendingReturnLink}</textarea>
+        <div class="menu-qr-wrap">${qrMarkup}</div>
+        <div class="menu-status">${networkMessage}</div>
+        <div class="menu-actions">
+          <button type="button" data-action="share-link">Share Return Link</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  menuOverlay.innerHTML = `
+    <div class="menu-panel">
+      <p class="menu-kicker">Link Hand-Off</p>
+      <h1>Answer received</h1>
+      <p class="menu-copy">${networkMessage}</p>
+      <div class="menu-actions">
+        <button type="button" data-action="home-from-relay">Back to Menu</button>
+      </div>
+    </div>
+  `;
+}
+
 function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: number): Fighter {
   const [color, accent] = palette[colorIndex % palette.length];
   return {
@@ -402,8 +651,71 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     rageTimer: 0,
     rageCooldown: 0,
     isBoss: false,
-    bossKind: "none"
+    bossKind: "none",
+    controller: isPlayer ? "local" : "none",
+    playerSlot: isPlayer ? 0 : null,
+    selectedWeapon: "pistol",
+    highestUnlockedWeapon: "pistol"
   };
+}
+
+function getHumanFighters() {
+  return fighters.filter((fighter) => fighter.isPlayer);
+}
+
+function getActiveHumanFighters() {
+  return fighters.filter((fighter) => fighter.isPlayer && fighter.respawn <= 0);
+}
+
+function getPrimaryPlayer() {
+  return fighters.find((fighter) => fighter.isPlayer && fighter.playerSlot === 0) ?? getHumanFighters()[0] ?? null;
+}
+
+function getRemotePlayer() {
+  return fighters.find((fighter) => fighter.isPlayer && fighter.playerSlot === 1) ?? null;
+}
+
+function getControlledPlayer() {
+  const targetSlot = multiplayerRole === "guest" ? 1 : 0;
+  return fighters.find((fighter) => fighter.isPlayer && fighter.playerSlot === targetSlot) ?? getPrimaryPlayer();
+}
+
+function getNearestActiveHuman(x: number, y: number) {
+  const targets = getActiveHumanFighters();
+  if (targets.length <= 0) {
+    return null;
+  }
+
+  return targets
+    .slice()
+    .sort((a, b) => Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y))[0];
+}
+
+function ensureRemotePlayerPresent() {
+  if (multiplayerRole !== "host" || getRemotePlayer()) {
+    return;
+  }
+
+  const point = getRandomSpawnPoint(7);
+  const remotePlayer = createFighter(point.x, point.y, true, 2);
+  remotePlayer.team = "ally";
+  remotePlayer.controller = "remote";
+  remotePlayer.playerSlot = 1;
+  remotePlayer.color = "#ff7a95";
+  remotePlayer.accent = "#ffe1ea";
+  fighters.push(remotePlayer);
+}
+
+function removeRemotePlayer() {
+  const remotePlayer = getRemotePlayer();
+  if (!remotePlayer) {
+    return;
+  }
+
+  const index = fighters.findIndex((fighter) => fighter.id === remotePlayer.id);
+  if (index >= 0) {
+    fighters.splice(index, 1);
+  }
 }
 
 function getEnemyPressureLevel() {
@@ -532,8 +844,6 @@ function spawnRoster() {
   medkitCooldown = 4.5;
   starCooldown = 8;
   shieldPickupCooldown = 18;
-  selectedWeapon = "pistol";
-  highestUnlockedWeapon = "pistol";
   pendingRunReset = false;
   survivalWithoutDeath = 0;
   bossFightStarted = false;
@@ -554,7 +864,14 @@ function spawnRoster() {
   skullBossBurstWindup = 0;
   bossesDefeated = 0;
   const playerSpawn = getRandomSpawnPoint(7);
-  fighters.push(createFighter(playerSpawn.x, playerSpawn.y, true, 0));
+  const player = createFighter(playerSpawn.x, playerSpawn.y, true, 0);
+  player.controller = multiplayerRole === "guest" ? "none" : "local";
+  player.playerSlot = 0;
+  fighters.push(player);
+
+  if (multiplayerRole === "host") {
+    ensureRemotePlayerPresent();
+  }
 
   spawnEnemyWave();
 }
@@ -603,7 +920,7 @@ function clearAmbientHazards() {
 }
 
 function playerHasInfiniteHealth(target: Fighter) {
-  return devInfiniteHealth && target.team === "player";
+  return devInfiniteHealth && target.isPlayer;
 }
 
 function ensureEnemyWavePresent() {
@@ -615,7 +932,7 @@ function ensureEnemyWavePresent() {
 
 function applyDevStage(stageIndex: number) {
   const snapshot = devStageSnapshots[clamp(stageIndex, 0, devStageSnapshots.length - 1)];
-  const player = fighters.find((fighter) => fighter.team === "player") ?? null;
+  const player = getPrimaryPlayer();
 
   clearAmbientHazards();
   despawnEnemies();
@@ -749,9 +1066,8 @@ function startBossFight(kind: BossKind) {
   despawnEnemies();
   clearAmbientHazards();
 
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
-  if (player) {
-    player.x = WORLD_WIDTH / 2;
+  for (const player of getActiveHumanFighters()) {
+    player.x = WORLD_WIDTH / 2 + (player.playerSlot === 1 ? 20 : -20);
     player.y = WORLD_HEIGHT / 2 + 58;
     player.vx = 0;
     player.vy = 0;
@@ -885,7 +1201,7 @@ function respawn(fighter: Fighter) {
   fighter.y = point.y;
   fighter.vx = 0;
   fighter.vy = 0;
-  if (fighter.team === "player") {
+  if (fighter.isPlayer) {
     fighter.maxHp = 100;
     fighter.critChance = 0.02;
     fighter.damageMultiplier = 1;
@@ -895,9 +1211,11 @@ function respawn(fighter: Fighter) {
     fighter.rageCharge = 100;
     fighter.rageTimer = 0;
     fighter.rageCooldown = 0;
-    selectedWeapon = "pistol";
-    highestUnlockedWeapon = "pistol";
-    spawnEnemyWave();
+    fighter.selectedWeapon = "pistol";
+    fighter.highestUnlockedWeapon = "pistol";
+    if (fighter.playerSlot === 0) {
+      spawnEnemyWave();
+    }
   }
   fighter.hp = fighter.maxHp;
   fighter.respawn = 0;
@@ -1130,15 +1448,15 @@ function getActivePlayerWeapon(player: Fighter) {
   const unlocked = getUnlockedWeapons(player.score);
   const newestUnlocked = unlocked[unlocked.length - 1];
 
-  if (weaponOrder.indexOf(newestUnlocked) > weaponOrder.indexOf(highestUnlockedWeapon)) {
-    selectedWeapon = newestUnlocked;
-    highestUnlockedWeapon = newestUnlocked;
-  } else if (!unlocked.includes(selectedWeapon)) {
-    selectedWeapon = newestUnlocked;
-    highestUnlockedWeapon = newestUnlocked;
+  if (weaponOrder.indexOf(newestUnlocked) > weaponOrder.indexOf(player.highestUnlockedWeapon)) {
+    player.selectedWeapon = newestUnlocked;
+    player.highestUnlockedWeapon = newestUnlocked;
+  } else if (!unlocked.includes(player.selectedWeapon)) {
+    player.selectedWeapon = newestUnlocked;
+    player.highestUnlockedWeapon = newestUnlocked;
   }
 
-  return selectedWeapon;
+  return player.selectedWeapon;
 }
 
 function createHelper(type: "red" | "green", player: Fighter) {
@@ -1261,15 +1579,42 @@ function chooseHelperTarget(helper: Fighter) {
     .sort((a, b) => a.distance - b.distance)[0];
 }
 
-function updatePlayer(player: Fighter, dt: number) {
-  const moveX = clamp(Number(input.right) - Number(input.left) + input.moveX, -1, 1);
-  const moveY = clamp(Number(input.down) - Number(input.up) + input.moveY, -1, 1);
+function getControlStateForFighter(fighter: Fighter) {
+  return fighter.controller === "remote" ? remoteInput : input;
+}
+
+function consumeQueuedCommands(fighter: Fighter) {
+  if (fighter.controller !== "remote") {
+    return;
+  }
+
+  if (remoteCommands.weaponSlot !== null) {
+    trySelectWeapon(remoteCommands.weaponSlot, fighter);
+  }
+  if (remoteCommands.shieldPressed) {
+    activateShield(fighter);
+  }
+  if (remoteCommands.ragePressed) {
+    activateRage(fighter);
+  }
+
+  remoteCommands.weaponSlot = null;
+  remoteCommands.shieldPressed = false;
+  remoteCommands.ragePressed = false;
+}
+
+function updateHumanFighter(player: Fighter, dt: number) {
+  const controls = getControlStateForFighter(player);
+  const moveX = clamp(Number(controls.right) - Number(controls.left) + controls.moveX, -1, 1);
+  const moveY = clamp(Number(controls.down) - Number(controls.up) + controls.moveY, -1, 1);
   const len = Math.hypot(moveX, moveY) || 1;
   player.vx = (moveX / len) * player.speed;
   player.vy = (moveY / len) * player.speed;
-  player.dir = Math.atan2(input.mouseY - player.y, input.mouseX - player.x);
+  player.dir = Math.atan2(controls.mouseY - player.y, controls.mouseX - player.x);
 
-  if (input.shoot) {
+  consumeQueuedCommands(player);
+
+  if (controls.shoot) {
     shoot(player);
   }
 
@@ -1312,7 +1657,7 @@ function updateBot(bot: Fighter, dt: number) {
   if (bot.archetype === "melee") {
     if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
       bot.attackCooldown = 0.65;
-      const baseDamage = enemy.team === "player" ? 10 * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE : 10;
+      const baseDamage = enemy.isPlayer ? 10 * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE : 10;
       const damage = playerHasInfiniteHealth(enemy) ? 0 : enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : baseDamage;
       enemy.hp -= damage;
       enemy.flash = 0.16;
@@ -1336,7 +1681,7 @@ function updateBot(bot: Fighter, dt: number) {
 }
 
 function updateHelper(helper: Fighter, dt: number) {
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  const player = getNearestActiveHuman(helper.x, helper.y);
   if (!player) {
     return;
   }
@@ -1656,7 +2001,7 @@ function summonSkullBossHazards() {
 function updateSkullBoss(boss: Fighter, dt: number) {
   boss.vx = 0;
   boss.vy = 0;
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
+  const player = getNearestActiveHuman(boss.x, boss.y);
   if (player) {
     boss.dir = Math.atan2(player.y - boss.y, player.x - boss.x);
   }
@@ -1707,7 +2052,7 @@ function updateBoss(boss: Fighter, dt: number) {
 
   boss.vx = 0;
   boss.vy = 0;
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0) ?? null;
+  const player = getNearestActiveHuman(boss.x, boss.y);
   if (player && bossIntroTimer <= 0 && bossAttackType !== "targeted") {
     boss.dir = Math.atan2(player.y - boss.y, player.x - boss.x);
   }
@@ -1756,7 +2101,7 @@ function updateBoss(boss: Fighter, dt: number) {
 }
 
 function reflectBulletOffBoss(bullet: Bullet, boss: Fighter) {
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0)
+  const player = getNearestActiveHuman(boss.x, boss.y)
     ?? getBossTargets()[0]
     ?? null;
 
@@ -1977,7 +2322,7 @@ function defeatFighter(target: Fighter, owner?: Fighter | null) {
 
   target.respawn = 2.2;
   target.hp = 0;
-  if (target.team === "player") {
+  if (target.isPlayer && target.playerSlot === 0) {
     clearRunStateOnPlayerDeath();
     pendingRunReset = true;
   } else {
@@ -2030,7 +2375,7 @@ function applyProjectileDamage(
   owner: Fighter | null
 ) {
   const scaledDamage =
-    target.team === "player" && owner?.team === "enemy" && !owner.isBoss
+    target.isPlayer && owner?.team === "enemy" && !owner.isBoss
       ? damage * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE
       : damage;
   const appliedDamage = playerHasInfiniteHealth(target)
@@ -2089,7 +2434,7 @@ function updateBullets(dt: number) {
           return false;
         }
         return (
-          fighter.team === "player" &&
+          fighter.isPlayer &&
           fighter.respawn <= 0 &&
           Math.hypot(fighter.x - bullet.x, fighter.y - bullet.y) < fighter.radius + bullet.size + 1
         );
@@ -2178,12 +2523,12 @@ function updateBullets(dt: number) {
       continue;
     }
 
-    const directHitKnockback = target.rageTimer > 0 && target.team === "player" ? 0 : bullet.isCrit ? 8 : 0;
+    const directHitKnockback = target.rageTimer > 0 && target.isPlayer ? 0 : bullet.isCrit ? 8 : 0;
     applyProjectileDamage(target, bullet.damage, bullet.x, bullet.y, directHitKnockback, owner);
     bullet.life = 0;
     playHitSound(false);
 
-    if (target.rageTimer > 0 && target.team === "player") {
+    if (target.rageTimer > 0 && target.isPlayer) {
       if (owner && owner.team === "enemy" && owner.respawn <= 0) {
         owner.hp -= bullet.damage;
         owner.flash = 0.18;
@@ -2318,7 +2663,7 @@ function spawnOrbitingSwordWave() {
 }
 
 function updateShopUpgrades(dt: number) {
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  const player = getPrimaryPlayer();
   if (!player) {
     return;
   }
@@ -2402,14 +2747,17 @@ function updateMedkits(dt: number) {
     medkitCooldown = 5 + Math.random() * 4;
   }
 
-  const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
-  if (!player) {
+  const humanPlayers = getActiveHumanFighters();
+  if (humanPlayers.length <= 0) {
     return;
   }
 
   for (let i = medkits.length - 1; i >= 0; i -= 1) {
     const medkit = medkits[i];
-    if (Math.hypot(player.x - medkit.x, player.y - medkit.y) < player.radius + 7) {
+    const player = humanPlayers.find(
+      (fighter) => Math.hypot(fighter.x - medkit.x, fighter.y - medkit.y) < fighter.radius + 7
+    );
+    if (player) {
       player.hp = Math.min(player.maxHp, player.hp + 32);
       medkits.splice(i, 1);
       playPickupSound();
@@ -2424,14 +2772,17 @@ function updateShieldPickups(dt: number) {
     shieldPickupCooldown = 18 + Math.random() * 10;
   }
 
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
-  if (!player) {
+  const humanPlayers = getActiveHumanFighters();
+  if (humanPlayers.length <= 0) {
     return;
   }
 
   for (let i = shieldPickups.length - 1; i >= 0; i -= 1) {
     const shieldPickup = shieldPickups[i];
-    if (Math.hypot(player.x - shieldPickup.x, player.y - shieldPickup.y) < player.radius + 7) {
+    const player = humanPlayers.find(
+      (fighter) => Math.hypot(fighter.x - shieldPickup.x, fighter.y - shieldPickup.y) < fighter.radius + 7
+    );
+    if (player) {
       player.shieldCount += 1;
       shieldPickups.splice(i, 1);
       playShieldSound();
@@ -2448,14 +2799,17 @@ function updateStars(dt: number, allowAutoSpawn = true) {
     }
   }
 
-  const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
-  if (!player) {
+  const humanPlayers = getActiveHumanFighters();
+  if (humanPlayers.length <= 0) {
     return;
   }
 
   for (let i = stars.length - 1; i >= 0; i -= 1) {
     const star = stars[i];
-    if (Math.hypot(player.x - star.x, player.y - star.y) < player.radius + 8) {
+    const player = humanPlayers.find(
+      (fighter) => Math.hypot(fighter.x - star.x, fighter.y - star.y) < fighter.radius + 8
+    );
+    if (player) {
       if (star.color === "blue") {
         const roll = Math.random();
         if (roll < 0.25) {
@@ -2500,8 +2854,6 @@ function updateLightning(dt: number, allowAutoSpawn = true) {
     lightningCooldown = 0;
   }
 
-  const player = fighters.find((fighter) => fighter.isPlayer && fighter.respawn <= 0);
-
   for (const strike of lightningStrikes) {
     strike.timer -= dt;
 
@@ -2511,25 +2863,29 @@ function updateLightning(dt: number, allowAutoSpawn = true) {
       playLightningSound();
     }
 
-    if (strike.active && !strike.hitApplied && player) {
-      const distanceFromLine = Math.abs(player.x - strike.x);
-      if (distanceFromLine < 14) {
-        if (!playerHasInfiniteHealth(player)) {
-          player.hp -= lightningSettings.damage;
-          if (player.rageTimer > 0) {
-            player.hp += lightningSettings.damage;
-            player.hp -= Math.round(lightningSettings.damage * 0.8);
-          }
-          player.flash = 0.22;
-          playHitSound(false);
+    if (strike.active && !strike.hitApplied) {
+      for (const player of getActiveHumanFighters()) {
+        const distanceFromLine = Math.abs(player.x - strike.x);
+        if (distanceFromLine >= 14 || playerHasInfiniteHealth(player)) {
+          continue;
+        }
 
-          if (player.hp <= 0) {
-            player.hp = 0;
-            player.respawn = 2.2;
+        player.hp -= lightningSettings.damage;
+        if (player.rageTimer > 0) {
+          player.hp += lightningSettings.damage;
+          player.hp -= Math.round(lightningSettings.damage * 0.8);
+        }
+        player.flash = 0.22;
+        playHitSound(false);
+
+        if (player.hp <= 0) {
+          player.hp = 0;
+          player.respawn = 2.2;
+          if (player.playerSlot === 0) {
             clearRunStateOnPlayerDeath();
             pendingRunReset = true;
-            playDefeatSound();
           }
+          playDefeatSound();
         }
       }
       strike.hitApplied = true;
@@ -2670,13 +3026,13 @@ function update(dt: number) {
   elapsed += dt;
   let shouldResetRoster = false;
   const shopActive = shopPhaseActive;
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  const player = getPrimaryPlayer();
 
-  if (player && !shopActive) {
+  if (player && player.respawn <= 0 && !shopActive) {
     survivalWithoutDeath += dt;
   }
 
-  if (player && !shopActive && !bossFightStarted && !bossFightWon) {
+  if (player && player.respawn <= 0 && !shopActive && !bossFightStarted && !bossFightWon) {
     if (bossesDefeated === 0 && survivalWithoutDeath >= 60) {
       startBossFight("iron");
     } else if (bossesDefeated === 1 && survivalWithoutDeath >= 120) {
@@ -2693,7 +3049,7 @@ function update(dt: number) {
     if (fighter.rageTimer <= 0) {
       fighter.rageCooldown = Math.max(0, fighter.rageCooldown - dt);
     }
-    if (fighter.team === "player" && fighter.rageTimer <= 0 && fighter.rageCooldown <= 0) {
+    if (fighter.isPlayer && fighter.rageTimer <= 0 && fighter.rageCooldown <= 0) {
       fighter.rageCharge = Math.min(100, fighter.rageCharge + dt * 8);
     }
     if (playerHasInfiniteHealth(fighter) && fighter.respawn <= 0) {
@@ -2703,7 +3059,7 @@ function update(dt: number) {
     if (fighter.respawn > 0) {
       fighter.respawn -= dt;
       if (fighter.respawn <= 0) {
-        if (fighter.team === "player" && pendingRunReset) {
+        if (fighter.isPlayer && fighter.playerSlot === 0 && pendingRunReset) {
           shouldResetRoster = true;
         } else {
           respawn(fighter);
@@ -2712,8 +3068,8 @@ function update(dt: number) {
       continue;
     }
 
-    if (fighter.team === "player") {
-      updatePlayer(fighter, dt);
+    if (fighter.isPlayer) {
+      updateHumanFighter(fighter, dt);
     } else if (fighter.team === "ally") {
       updateHelper(fighter, dt);
     } else if (fighter.isBoss) {
@@ -2745,6 +3101,8 @@ function update(dt: number) {
   if (shouldResetRoster) {
     spawnRoster();
   }
+
+  maybeBroadcastSnapshot(dt);
 
   liveReloadSaveTimer -= dt;
   if (liveReloadSaveTimer <= 0) {
@@ -3268,7 +3626,7 @@ function drawShopReadyButton() {
 }
 
 function drawOrbitingSwords() {
-  const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+  const player = getPrimaryPlayer();
   if (!player || orbitingSwords.length <= 0) {
     return;
   }
@@ -3389,7 +3747,7 @@ function tryEnterMobileFullscreen() {
 }
 
 function drawHud() {
-  const player = fighters.find((fighter) => fighter.team === "player");
+  const player = getControlledPlayer();
   if (!player) {
     return;
   }
@@ -3697,14 +4055,916 @@ function render() {
   drawPauseOverlay();
 }
 
+function setNetworkBanner(status: NetworkStatus, message: string) {
+  networkStatus = status;
+  networkMessage = message;
+  menuOverlay.dataset.state = status;
+  renderMenu();
+}
+
+function setMenuScreen(screen: MenuScreen) {
+  menuScreen = screen;
+  menuOpen = true;
+  if (scannerMode) {
+    void stopScanner(false);
+  }
+  renderMenu();
+}
+
+function clearShareArtifacts() {
+  pendingShareLink = "";
+  pendingReturnLink = "";
+  linkInputValue = "";
+  answerInputValue = "";
+  updateQrImage("");
+}
+
+function openMenu(screen: MenuScreen = "home") {
+  menuOpen = true;
+  if (gameStarted) {
+    isPaused = true;
+    input.shoot = false;
+  }
+  menuScreen = screen;
+  if (scannerMode) {
+    void stopScanner(false);
+  }
+  renderMenu();
+}
+
+function closeMenu() {
+  menuOpen = false;
+  if (scannerMode) {
+    void stopScanner(false);
+  }
+  if (gameStarted) {
+    isPaused = false;
+  }
+  renderMenu();
+}
+
+function toggleGameMenu() {
+  if (!gameStarted) {
+    openMenu("home");
+    return;
+  }
+
+  if (menuOpen) {
+    closeMenu();
+  } else {
+    openMenu("home");
+  }
+}
+
+function resetToMenuHome() {
+  gameStarted = false;
+  menuOpen = true;
+  clearShareArtifacts();
+  setMenuScreen("home");
+  setNetworkBanner("offline", "Solo run");
+}
+
+function startSoloGame() {
+  disconnectMultiplayer(false);
+  gameStarted = true;
+  isPaused = false;
+  spawnRoster();
+  closeMenu();
+}
+
+function startConnectedGame() {
+  gameStarted = true;
+  isPaused = false;
+  closeMenu();
+}
+
+function createSessionId() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return Array.from(bytes, (value) => alphabet[value % alphabet.length]).join("");
+}
+
+function base64UrlEncodeBinary(binary: string) {
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function base64UrlDecodeBinary(text: string) {
+  const padding = text.length % 4 === 0 ? "" : "=".repeat(4 - (text.length % 4));
+  return atob(text.replace(/-/g, "+").replace(/_/g, "/") + padding);
+}
+
+function bytesToBinary(bytes: Uint8Array) {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return binary;
+}
+
+function binaryToBytes(binary: string) {
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function base64UrlEncodeText(text: string) {
+  return base64UrlEncodeBinary(bytesToBinary(new TextEncoder().encode(text)));
+}
+
+function base64UrlDecodeText(text: string) {
+  return new TextDecoder().decode(binaryToBytes(base64UrlDecodeBinary(text)));
+}
+
+const sdpCompressionTable = [
+  "candidate:",
+  "typ host",
+  "typ srflx",
+  "typ relay",
+  " generation 0",
+  " network-id ",
+  " network-cost ",
+  " udp ",
+  " tcptype active",
+  "a=candidate:",
+  "a=ice-ufrag:",
+  "a=ice-pwd:",
+  "a=fingerprint:sha-256 ",
+  "a=setup:actpass",
+  "a=setup:active",
+  "a=mid:0",
+  "a=sctp-port:5000",
+  "a=max-message-size:262144",
+  "a=sendrecv",
+  "a=group:BUNDLE 0",
+  "a=extmap-allow-mixed",
+  "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+  "c=IN IP4 0.0.0.0",
+  "s=-",
+  "t=0 0"
+] as const;
+
+function compactSdp(sdp: string) {
+  let compacted = sdp.replace(/\r\n/g, "\n");
+  sdpCompressionTable.forEach((entry, index) => {
+    compacted = compacted.split(entry).join(`~${index.toString(36)}~`);
+  });
+  return compacted;
+}
+
+function expandSdp(compacted: string) {
+  let expanded = compacted;
+  sdpCompressionTable.forEach((entry, index) => {
+    expanded = expanded.split(`~${index.toString(36)}~`).join(entry);
+  });
+  return expanded.replace(/\n/g, "\r\n");
+}
+
+async function encodeSignal(signal: RTCSessionDescriptionInit) {
+  const packed = JSON.stringify({
+    t: signal.type,
+    s: compactSdp(signal.sdp ?? "")
+  });
+  return `c.${base64UrlEncodeText(packed)}`;
+}
+
+async function decodeSignal(encoded: string) {
+  const [codec, payload] = encoded.includes(".") ? encoded.split(".", 2) : ["p", encoded];
+  if (codec === "c") {
+    const parsed = JSON.parse(base64UrlDecodeText(payload)) as { t: RTCSdpType; s: string };
+    return {
+      type: parsed.t,
+      sdp: expandSdp(parsed.s)
+    } as RTCSessionDescriptionInit;
+  }
+
+  if (codec === "p") {
+    return JSON.parse(base64UrlDecodeText(payload)) as RTCSessionDescriptionInit;
+  }
+
+  if (codec !== "z") {
+    throw new Error("Unsupported invite format");
+  }
+
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("This browser cannot read compressed invites");
+  }
+
+  const stream = new DecompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  await writer.write(binaryToBytes(base64UrlDecodeBinary(payload)));
+  await writer.close();
+  const json = await new Response(stream.readable).text();
+  return JSON.parse(json) as RTCSessionDescriptionInit;
+}
+
+async function buildSignalLink(kind: "offer" | "answer", sessionId: string, signal: RTCSessionDescriptionInit) {
+  const encodedSignal = await encodeSignal(signal);
+  const url = new URL(window.location.href);
+  url.hash = new URLSearchParams({
+    p: kind === "offer" ? "o" : "a",
+    s: sessionId,
+    d: encodedSignal
+  }).toString();
+  return url.toString();
+}
+
+async function shareOrCopyLink(link: string, title: string) {
+  if (!link) {
+    return;
+  }
+
+  if (navigator.share) {
+    try {
+      await navigator.share({
+        title,
+        text: title,
+        url: link
+      });
+      return;
+    } catch {
+      // Fall through to clipboard copy if share was cancelled or unavailable.
+    }
+  }
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(link);
+    setNetworkBanner(networkStatus, "Link copied to clipboard");
+  }
+}
+
+function relayAnswerToExistingHost(sessionId: string, signal: string) {
+  const payload = JSON.stringify({ sessionId, signal, sentAt: Date.now() });
+  try {
+    localStorage.setItem(`${ANSWER_RELAY_KEY_PREFIX}${sessionId}`, payload);
+  } catch {
+    // Ignore storage failures and rely on manual fallback messaging.
+  }
+
+  try {
+    answerRelayChannel?.postMessage({ sessionId, signal });
+  } catch {
+    // Ignore broadcast failures and rely on storage polling.
+  }
+}
+
+function consumeStoredAnswer(sessionId: string) {
+  const key = `${ANSWER_RELAY_KEY_PREFIX}${sessionId}`;
+  const raw = localStorage.getItem(key);
+  if (!raw) {
+    return;
+  }
+
+  try {
+    const payload = JSON.parse(raw) as { sessionId: string; signal: string };
+    handleRelayMessage(payload.sessionId, payload.signal);
+    localStorage.removeItem(key);
+  } catch {
+    localStorage.removeItem(key);
+    setNetworkBanner("error", "Failed to read saved answer");
+  }
+}
+
+async function stopScanner(renderAfter = true) {
+  scannerMode = null;
+  scannerError = "";
+  scannerBusy = false;
+  if (scannerAnimationFrameId) {
+    cancelAnimationFrame(scannerAnimationFrameId);
+    scannerAnimationFrameId = 0;
+  }
+  scannerVideo?.pause();
+  scannerVideo = null;
+  scannerStream?.getTracks().forEach((track) => track.stop());
+  scannerStream = null;
+  if (renderAfter) {
+    renderMenu();
+  }
+}
+
+async function processScannedCode(rawValue: string, mode: Exclude<ScannerMode, null>) {
+  if (mode === "invite") {
+    linkInputValue = rawValue;
+    await handleInviteLink(rawValue);
+    return;
+  }
+
+  answerInputValue = rawValue;
+  await handleAnswerLink(rawValue);
+}
+
+async function tickScanner(detector: QrDetectorInstance, mode: Exclude<ScannerMode, null>) {
+  if (!scannerVideo || scannerMode !== mode) {
+    return;
+  }
+
+  try {
+    const matches = await detector.detect(scannerVideo);
+    const match = matches.find((candidate) => candidate.rawValue);
+    if (match?.rawValue) {
+      await stopScanner(false);
+      await processScannedCode(match.rawValue, mode);
+      renderMenu();
+      return;
+    }
+  } catch {
+    scannerError = "Camera is active, but QR detection is not available in this browser.";
+    await stopScanner();
+    return;
+  }
+
+  scannerAnimationFrameId = requestAnimationFrame(() => {
+    void tickScanner(detector, mode);
+  });
+}
+
+async function startScanner(mode: Exclude<ScannerMode, null>) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    const message = window.isSecureContext
+      ? "Camera scanning is not available in this browser. Paste the link instead."
+      : "Camera scanning needs HTTPS (or localhost). On phone, open the game over HTTPS and use the text field for now.";
+    scannerError = message;
+    setNetworkBanner("error", message);
+    return;
+  }
+
+  if (!BarcodeDetectorClass) {
+    const message = "QR scanning is not supported in this browser. Paste the link instead.";
+    scannerError = message;
+    setNetworkBanner("error", message);
+    return;
+  }
+
+  await stopScanner(false);
+  scannerMode = mode;
+  scannerBusy = true;
+  scannerError = "";
+  renderMenu();
+
+  try {
+    scannerStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: {
+          ideal: "environment"
+        }
+      }
+    });
+    scannerVideo = menuOverlay.querySelector<HTMLVideoElement>("#menu-scanner-video");
+    if (!scannerVideo) {
+      throw new Error("Scanner preview failed to initialize");
+    }
+
+    scannerVideo.srcObject = scannerStream;
+    await scannerVideo.play();
+    const detector = new BarcodeDetectorClass({
+      formats: ["qr_code"]
+    });
+    setNetworkBanner("waiting-for-peer", "Camera ready. Point it at the QR code.");
+    void tickScanner(detector, mode);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not start the camera. Paste the link instead.";
+    await stopScanner(false);
+    scannerError = message;
+    setNetworkBanner("error", message);
+  }
+}
+
+function clearConnectionTimeout() {
+  if (connectionTimeoutId !== null) {
+    window.clearTimeout(connectionTimeoutId);
+    connectionTimeoutId = null;
+  }
+}
+
+function scheduleConnectionTimeout(role: MultiplayerRole) {
+  clearConnectionTimeout();
+  connectionTimeoutId = window.setTimeout(() => {
+    if (dataChannel?.readyState === "open") {
+      return;
+    }
+
+    setNetworkBanner(
+      "error",
+      role === "host"
+        ? "Still connecting. Keep the guest page open. If this is over the internet, direct no-server P2P may be blocked by NAT/firewalls."
+        : "Still connecting. Keep this page open while the host accepts the return link."
+    );
+  }, 12000);
+}
+
+function clearOutgoingGuestCommands() {
+  outgoingGuestCommands.weaponSlot = null;
+  outgoingGuestCommands.shieldPressed = false;
+  outgoingGuestCommands.ragePressed = false;
+}
+
+function resetRemoteControlState() {
+  Object.assign(remoteInput, createControlState());
+  remoteCommands.weaponSlot = null;
+  remoteCommands.shieldPressed = false;
+  remoteCommands.ragePressed = false;
+}
+
+function sendPacket(packet: NetworkPacket) {
+  if (!dataChannel || dataChannel.readyState !== "open") {
+    return;
+  }
+
+  dataChannel.send(JSON.stringify(packet));
+}
+
+function handleNetworkPacket(raw: string) {
+  try {
+    const packet = JSON.parse(raw) as NetworkPacket;
+    if (packet.type === "input" && multiplayerRole === "host") {
+      Object.assign(remoteInput, packet.payload);
+      remoteCommands.weaponSlot = packet.payload.weaponSlot;
+      remoteCommands.shieldPressed = packet.payload.shieldPressed;
+      remoteCommands.ragePressed = packet.payload.ragePressed;
+      return;
+    }
+
+    if (packet.type === "snapshot" && multiplayerRole === "guest") {
+      applyRuntimeSnapshot(packet.payload);
+      lastSnapshotReceivedAt = performance.now();
+    }
+  } catch {
+    setNetworkBanner("error", "Received invalid network packet");
+  }
+}
+
+function attachDataChannel(channel: RTCDataChannel) {
+  dataChannel = channel;
+  dataChannel.onopen = () => {
+    clearConnectionTimeout();
+    if (multiplayerRole === "host") {
+      ensureRemotePlayerPresent();
+      setNetworkBanner("connected", "Host connected to guest");
+      if (!gameStarted) {
+        spawnRoster();
+      }
+      startConnectedGame();
+    } else if (multiplayerRole === "guest") {
+      setNetworkBanner("connected", "Guest connected to host");
+      startConnectedGame();
+    }
+  };
+  dataChannel.onclose = () => {
+    clearConnectionTimeout();
+    if (multiplayerRole === "host") {
+      removeRemotePlayer();
+      resetRemoteControlState();
+      gameStarted = false;
+      multiplayerRole = "solo";
+      setMenuScreen("home");
+      setNetworkBanner("offline", "Peer disconnected");
+    } else if (multiplayerRole === "guest") {
+      gameStarted = false;
+      multiplayerRole = "solo";
+      resetRemoteControlState();
+      setMenuScreen("home");
+      setNetworkBanner("offline", "Connection closed");
+    } else {
+      setNetworkBanner("offline", "Solo run");
+    }
+  };
+  dataChannel.onmessage = (event) => {
+    handleNetworkPacket(String(event.data));
+  };
+}
+
+function attachPeerConnection(connection: RTCPeerConnection) {
+  peerConnection = connection;
+  peerConnection.ondatachannel = (event) => {
+    attachDataChannel(event.channel);
+  };
+  peerConnection.onconnectionstatechange = () => {
+    const state = peerConnection?.connectionState;
+    if (state === "failed") {
+      clearConnectionTimeout();
+      setNetworkBanner("error", "Peer connection failed");
+    } else if (state === "connecting") {
+      setNetworkBanner("connecting", multiplayerRole === "host" ? "Host connecting..." : "Guest connecting...");
+      scheduleConnectionTimeout(multiplayerRole);
+    } else if (state === "disconnected") {
+      clearConnectionTimeout();
+      setNetworkBanner("error", "Peer disconnected during setup");
+    } else if (state === "connected") {
+      clearConnectionTimeout();
+    }
+  };
+  peerConnection.oniceconnectionstatechange = () => {
+    const state = peerConnection?.iceConnectionState;
+    if (state === "checking") {
+      setNetworkBanner("connecting", multiplayerRole === "host" ? "Host connecting..." : "Guest connecting...");
+      scheduleConnectionTimeout(multiplayerRole);
+    } else if (state === "failed") {
+      clearConnectionTimeout();
+      setNetworkBanner(
+        "error",
+        "Direct peer connection failed. This no-server mode needs compatible NAT/firewall conditions or the same LAN."
+      );
+    }
+  };
+}
+
+async function waitForIceCompletion(connection: RTCPeerConnection, timeoutMs = 2500) {
+  if (connection.iceGatheringState === "complete") {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const timeoutId = window.setTimeout(() => {
+      connection.removeEventListener("icegatheringstatechange", onGatheringStateChange);
+      resolve();
+    }, timeoutMs);
+
+    const onGatheringStateChange = () => {
+      if (connection.iceGatheringState === "complete") {
+        window.clearTimeout(timeoutId);
+        connection.removeEventListener("icegatheringstatechange", onGatheringStateChange);
+        resolve();
+      }
+    };
+    connection.addEventListener("icegatheringstatechange", onGatheringStateChange);
+  });
+}
+
+function closeNetworkConnection() {
+  clearConnectionTimeout();
+  dataChannel?.close();
+  dataChannel = null;
+  peerConnection?.close();
+  peerConnection = null;
+}
+
+async function startHostingSession() {
+  if (typeof RTCPeerConnection === "undefined") {
+    throw new Error("This browser does not support WebRTC hosting");
+  }
+
+  closeNetworkConnection();
+  resetRemoteControlState();
+  removeRemotePlayer();
+  multiplayerRole = "host";
+  pendingSessionId = createSessionId();
+  gameStarted = false;
+  clearShareArtifacts();
+  setMenuScreen("host");
+  setNetworkBanner("preparing", "Preparing host offer...");
+
+  const connection = new RTCPeerConnection(rtcConfiguration);
+  attachPeerConnection(connection);
+  attachDataChannel(connection.createDataChannel("pixel-bot-brawler", {
+    ordered: true
+  }));
+  const offer = await connection.createOffer();
+  await connection.setLocalDescription(offer);
+  await waitForIceCompletion(connection);
+  if (!connection.localDescription) {
+    throw new Error("Host offer not available");
+  }
+  pendingShareLink = await buildSignalLink("offer", pendingSessionId, connection.localDescription);
+  updateQrImage(pendingShareLink);
+  setNetworkBanner(
+    "waiting-for-peer",
+    connection.iceGatheringState === "complete"
+      ? "Waiting for your friend to open the invite"
+      : "Invite ready. If connection fails, wait a moment and create a fresh invite."
+  );
+  consumeStoredAnswer(pendingSessionId);
+}
+
+async function joinSessionFromOffer(encodedSignal: string, sessionId: string) {
+  closeNetworkConnection();
+  resetRemoteControlState();
+  multiplayerRole = "guest";
+  pendingSessionId = sessionId;
+  gameStarted = false;
+  clearShareArtifacts();
+  setNetworkBanner("joining", "Joining host offer...");
+
+  const connection = new RTCPeerConnection(rtcConfiguration);
+  attachPeerConnection(connection);
+  const offer = await decodeSignal(encodedSignal);
+  await connection.setRemoteDescription(offer);
+  const answer = await connection.createAnswer();
+  await connection.setLocalDescription(answer);
+  await waitForIceCompletion(connection);
+  if (!connection.localDescription) {
+    throw new Error("Guest answer not available");
+  }
+  pendingReturnLink = await buildSignalLink("answer", sessionId, connection.localDescription);
+  updateQrImage(pendingReturnLink);
+  setMenuScreen("guest-share");
+  setNetworkBanner(
+    "waiting-for-peer",
+    connection.iceGatheringState === "complete"
+      ? "Share the return link back to the host"
+      : "Reply ready. If connection fails, wait a moment and rescan the invite."
+  );
+  scheduleConnectionTimeout("guest");
+}
+
+async function applyGuestAnswer(encodedSignal: string) {
+  if (!peerConnection || multiplayerRole !== "host") {
+    throw new Error("Create a host offer first");
+  }
+
+  const answer = await decodeSignal(encodedSignal);
+  await peerConnection.setRemoteDescription(answer);
+  setNetworkBanner("connecting", "Waiting for data channel. Keep the guest page open.");
+  scheduleConnectionTimeout("host");
+  localStorage.removeItem(`${ANSWER_RELAY_KEY_PREFIX}${pendingSessionId}`);
+}
+
+function disconnectMultiplayer(showMenu = true) {
+  closeNetworkConnection();
+  resetRemoteControlState();
+  clearOutgoingGuestCommands();
+  removeRemotePlayer();
+  multiplayerRole = "solo";
+  pendingSessionId = "";
+  clearShareArtifacts();
+  gameStarted = false;
+  menuOpen = showMenu;
+  isPaused = false;
+
+  if (showMenu) {
+    setMenuScreen("home");
+  }
+  setNetworkBanner("offline", "Solo run");
+}
+
+function maybeBroadcastSnapshot(dt: number) {
+  if (multiplayerRole !== "host" || !dataChannel || dataChannel.readyState !== "open") {
+    return;
+  }
+
+  snapshotBroadcastTimer -= dt;
+  if (snapshotBroadcastTimer > 0) {
+    return;
+  }
+
+  snapshotBroadcastTimer = SNAPSHOT_SEND_INTERVAL;
+  sendPacket({
+    type: "snapshot",
+    payload: createRuntimeSnapshot()
+  });
+}
+
+function maybeSendGuestInput(now: number) {
+  if (multiplayerRole !== "guest" || !dataChannel || dataChannel.readyState !== "open") {
+    return;
+  }
+
+  if (now - lastGuestInputSentAt < GUEST_INPUT_SEND_INTERVAL * 1000) {
+    return;
+  }
+
+  lastGuestInputSentAt = now;
+  localInputSequence += 1;
+  sendPacket({
+    type: "input",
+    payload: {
+      ...input,
+      ...outgoingGuestCommands,
+      seq: localInputSequence
+    }
+  });
+  clearOutgoingGuestCommands();
+}
+
+async function handleInviteLink(rawLink: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawLink.trim(), window.location.href);
+  } catch {
+    throw new Error("That link does not look valid");
+  }
+
+  const params = new URLSearchParams(parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash);
+  const type = params.get("p") ?? params.get("p2p");
+  const signal = params.get("d") ?? params.get("signal");
+  const sessionId = params.get("s") ?? params.get("session");
+
+  if (!signal || !sessionId || (type !== "o" && type !== "offer")) {
+    throw new Error("Invite link is missing offer data");
+  }
+
+  await joinSessionFromOffer(signal, sessionId);
+}
+
+async function handleAnswerLink(rawLink: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawLink.trim(), window.location.href);
+  } catch {
+    throw new Error("That reply link does not look valid");
+  }
+
+  const params = new URLSearchParams(parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash);
+  const type = params.get("p") ?? params.get("p2p");
+  const signal = params.get("d") ?? params.get("signal");
+  const sessionId = params.get("s") ?? params.get("session");
+
+  if (!signal || !sessionId || (type !== "a" && type !== "answer")) {
+    throw new Error("Reply link is missing answer data");
+  }
+
+  if (pendingSessionId && sessionId !== pendingSessionId) {
+    throw new Error("This reply belongs to a different room");
+  }
+
+  await applyGuestAnswer(signal);
+}
+
+function handleRelayMessage(sessionId: string, signal: string) {
+  if (multiplayerRole !== "host" || sessionId !== pendingSessionId) {
+    return;
+  }
+
+  void applyGuestAnswer(signal).catch((error: unknown) => {
+    setNetworkBanner("error", error instanceof Error ? error.message : "Failed to apply answer");
+  });
+}
+
+function processIncomingRoute() {
+  const params = new URLSearchParams(window.location.hash.startsWith("#") ? window.location.hash.slice(1) : "");
+  const type = params.get("p") ?? params.get("p2p");
+  const signal = params.get("d") ?? params.get("signal");
+  const sessionId = params.get("s") ?? params.get("session");
+
+  if (!type || !signal || !sessionId) {
+    return;
+  }
+
+  if (type === "o" || type === "offer") {
+    linkInputValue = window.location.href;
+    setMenuScreen("join");
+    void handleInviteLink(window.location.href).catch((error: unknown) => {
+      setNetworkBanner("error", error instanceof Error ? error.message : "Failed to join from invite");
+    });
+    history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    return;
+  }
+
+  if (type === "a" || type === "answer") {
+    relayAnswerToExistingHost(sessionId, signal);
+    setMenuScreen("relay-answer");
+    setNetworkBanner("waiting-for-peer", "If the host room is open on this device, the answer was sent to it automatically.");
+    history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  }
+}
+
+menuOverlay.addEventListener("click", (event) => {
+  const copyField = (event.target as HTMLElement).closest<HTMLTextAreaElement>("textarea[data-copy-value]");
+  if (copyField) {
+    const value = copyField.dataset.copyValue ?? copyField.value;
+    if (value && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(value).then(() => {
+        setNetworkBanner(networkStatus, "Link copied to clipboard");
+      });
+    }
+    return;
+  }
+
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-action]");
+  if (!button) {
+    return;
+  }
+
+  const action = button.dataset.action;
+  if (action === "new-game") {
+    startSoloGame();
+    return;
+  }
+
+  if (action === "resume-game") {
+    closeMenu();
+    return;
+  }
+
+  if (action === "play-friend") {
+    setMenuScreen("friend");
+    return;
+  }
+
+  if (action === "back-home" || action === "home-from-relay") {
+    resetToMenuHome();
+    return;
+  }
+
+  if (action === "back-friend") {
+    setMenuScreen("friend");
+    return;
+  }
+
+  if (action === "create-room") {
+    setMenuScreen("host");
+    void startHostingSession().catch((error: unknown) => {
+      setMenuScreen("host");
+      setNetworkBanner("error", error instanceof Error ? error.message : "Failed to create game");
+    });
+    return;
+  }
+
+  if (action === "show-join") {
+    setMenuScreen("join");
+    return;
+  }
+
+  if (action === "join-link") {
+    const field = menuOverlay.querySelector<HTMLTextAreaElement>("#menu-link-input");
+    linkInputValue = field?.value ?? "";
+    void handleInviteLink(linkInputValue).catch((error: unknown) => {
+      setNetworkBanner("error", error instanceof Error ? error.message : "Failed to join game");
+    });
+    return;
+  }
+
+  if (action === "scan-invite") {
+    void startScanner("invite");
+    return;
+  }
+
+  if (action === "scan-reply") {
+    void startScanner("reply");
+    return;
+  }
+
+  if (action === "stop-scan") {
+    void stopScanner();
+    return;
+  }
+
+  if (action === "connect-reply") {
+    const field = menuOverlay.querySelector<HTMLTextAreaElement>("#menu-answer-input");
+    answerInputValue = field?.value ?? "";
+    void handleAnswerLink(answerInputValue).catch((error: unknown) => {
+      setNetworkBanner("error", error instanceof Error ? error.message : "Failed to apply guest reply");
+    });
+    return;
+  }
+
+  if (action === "share-link") {
+    const link = menuScreen === "guest-share" ? pendingReturnLink : pendingShareLink;
+    const label = menuScreen === "guest-share" ? "Pixel Bot Brawler return link" : "Pixel Bot Brawler invite";
+    void shareOrCopyLink(link, label);
+    return;
+  }
+
+  if (action === "copy-link") {
+    const link = menuScreen === "guest-share" ? pendingReturnLink : pendingShareLink;
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(link).then(() => {
+        setNetworkBanner(networkStatus, "Link copied to clipboard");
+      });
+    }
+    return;
+  }
+
+  if (action === "cancel-room") {
+    disconnectMultiplayer();
+  }
+});
+
+window.addEventListener("storage", (event) => {
+  if (!event.key?.startsWith(ANSWER_RELAY_KEY_PREFIX) || !event.newValue) {
+    return;
+  }
+
+  try {
+    const payload = JSON.parse(event.newValue) as { sessionId: string; signal: string };
+    handleRelayMessage(payload.sessionId, payload.signal);
+  } catch {
+    setNetworkBanner("error", "Failed to read answer hand-off");
+  }
+});
+
+if ("BroadcastChannel" in window) {
+  answerRelayChannel = new BroadcastChannel("pixel-bot-brawler-answer-relay");
+  answerRelayChannel.addEventListener("message", (event: MessageEvent<{ sessionId: string; signal: string }>) => {
+    handleRelayMessage(event.data.sessionId, event.data.signal);
+  });
+}
+
+renderMenu();
+processIncomingRoute();
+
 let previous = performance.now();
 
 function frame(now: number) {
   const dt = Math.min(0.033, (now - previous) / 1000);
   previous = now;
-  if (!isPaused) {
+  if (gameStarted && multiplayerRole !== "guest" && !isPaused) {
     update(dt);
   }
+  maybeSendGuestInput(now);
   render();
   requestAnimationFrame(frame);
 }
@@ -3729,6 +4989,10 @@ function isInsideRect(x: number, y: number, rectX: number, rectY: number, width:
   return x >= rectX && x <= rectX + width && y >= rectY && y <= rectY + height;
 }
 
+function isTextEntryTarget(target: EventTarget | null) {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+}
+
 function setMovementKey(code: string, isPressed: boolean) {
   if (code === "KeyW" || code === "ArrowUp") input.up = isPressed;
   if (code === "KeyS" || code === "ArrowDown") input.down = isPressed;
@@ -3746,8 +5010,7 @@ function resetMovementInputState() {
   resetTouchMovement();
 }
 
-function trySelectWeapon(slot: number) {
-  const player = fighters.find((fighter) => fighter.team === "player");
+function trySelectWeapon(slot: number, player = getControlledPlayer()) {
   if (!player) {
     return;
   }
@@ -3758,18 +5021,24 @@ function trySelectWeapon(slot: number) {
   }
 
   if (getUnlockedWeapons(player.score).includes(weapon)) {
-    selectedWeapon = weapon;
+    player.selectedWeapon = weapon;
   }
 }
 
+function queueGuestWeaponSelection(slot: number) {
+  outgoingGuestCommands.weaponSlot = slot;
+}
+
+function queueGuestShield() {
+  outgoingGuestCommands.shieldPressed = true;
+}
+
+function queueGuestRage() {
+  outgoingGuestCommands.ragePressed = true;
+}
+
 function togglePause() {
-  isPaused = !isPaused;
-  if (isPaused) {
-    input.shoot = false;
-  } else {
-    showRulesMenu = false;
-    rulesScroll = 0;
-  }
+  toggleGameMenu();
 }
 
 function updateTouchMovement(clientX: number, clientY: number) {
@@ -3800,7 +5069,7 @@ function updateTouchAim(clientX: number, clientY: number) {
   if (distance > 3) {
     const aimX = dx / distance;
     const aimY = dy / distance;
-    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    const player = getControlledPlayer();
 
     if (player) {
       input.mouseX = player.x + aimX * 48;
@@ -3858,7 +5127,10 @@ function handleTouchPress(clientX: number, clientY: number) {
 
   if (shopPhaseActive) {
     const readyRect = getShopReadyButtonRect();
-    if (isInsideRect(point.x, point.y, readyRect.x, readyRect.y, readyRect.width, readyRect.height)) {
+    if (
+      multiplayerRole !== "guest" &&
+      isInsideRect(point.x, point.y, readyRect.x, readyRect.y, readyRect.width, readyRect.height)
+    ) {
       endShopPhase();
       return true;
     }
@@ -3867,9 +5139,11 @@ function handleTouchPress(clientX: number, clientY: number) {
   if (touchControls.enabled) {
     const rageRect = getMobileRageButtonRect();
     if (isInsideRect(point.x, point.y, rageRect.x, rageRect.y, rageRect.width, rageRect.height)) {
-      const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
-      if (player) {
+      const player = getControlledPlayer();
+      if (player && multiplayerRole !== "guest") {
         activateRage(player);
+      } else if (multiplayerRole === "guest") {
+        queueGuestRage();
       }
       return true;
     }
@@ -3877,7 +5151,11 @@ function handleTouchPress(clientX: number, clientY: number) {
     for (let index = 0; index < weaponOrder.length; index += 1) {
       const rect = getMobileWeaponButtonRect(index);
       if (isInsideRect(point.x, point.y, rect.x, rect.y, rect.width, rect.height)) {
-        trySelectWeapon(index);
+        if (multiplayerRole === "guest") {
+          queueGuestWeaponSelection(index);
+        } else {
+          trySelectWeapon(index);
+        }
         return true;
       }
     }
@@ -3887,6 +5165,10 @@ function handleTouchPress(clientX: number, clientY: number) {
 }
 
 window.addEventListener("keydown", (event) => {
+  if (isTextEntryTarget(event.target)) {
+    return;
+  }
+
   if (event.repeat) {
     return;
   }
@@ -3905,7 +5187,7 @@ window.addEventListener("keydown", (event) => {
 
   if (event.code === "Backslash") {
     devInfiniteHealth = !devInfiniteHealth;
-    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    const player = getPrimaryPlayer();
     if (devInfiniteHealth && player) {
       player.hp = player.maxHp;
     }
@@ -3914,7 +5196,7 @@ window.addEventListener("keydown", (event) => {
   }
 
   if (event.key === "+" || event.code === "NumpadAdd") {
-    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
+    const player = getPrimaryPlayer();
     if (player) {
       player.score += DEBUG_SHOP_POINTS_BONUS;
       playPickupSound();
@@ -3924,30 +5206,34 @@ window.addEventListener("keydown", (event) => {
   }
 
   if (event.code === "KeyP" || event.code === "Escape") {
-    togglePause();
+    toggleGameMenu();
     event.preventDefault();
     return;
   }
 
   setMovementKey(event.code, true);
   if (event.code === "KeyE") {
-    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
-    if (player && !isPaused) {
+    const player = getControlledPlayer();
+    if (multiplayerRole === "guest") {
+      queueGuestShield();
+    } else if (player && !isPaused) {
       activateShield(player);
     }
   }
   if (event.code === "Space") {
-    const player = fighters.find((fighter) => fighter.team === "player" && fighter.respawn <= 0);
-    if (player && !isPaused) {
+    const player = getControlledPlayer();
+    if (multiplayerRole === "guest") {
+      queueGuestRage();
+    } else if (player && !isPaused) {
       activateRage(player);
     }
     event.preventDefault();
   }
-  if (event.code === "Digit1") trySelectWeapon(0);
-  if (event.code === "Digit2") trySelectWeapon(1);
-  if (event.code === "Digit3") trySelectWeapon(2);
-  if (event.code === "Digit4") trySelectWeapon(3);
-  if (event.code === "Digit5") trySelectWeapon(4);
+  if (event.code === "Digit1") multiplayerRole === "guest" ? queueGuestWeaponSelection(0) : trySelectWeapon(0);
+  if (event.code === "Digit2") multiplayerRole === "guest" ? queueGuestWeaponSelection(1) : trySelectWeapon(1);
+  if (event.code === "Digit3") multiplayerRole === "guest" ? queueGuestWeaponSelection(2) : trySelectWeapon(2);
+  if (event.code === "Digit4") multiplayerRole === "guest" ? queueGuestWeaponSelection(3) : trySelectWeapon(3);
+  if (event.code === "Digit5") multiplayerRole === "guest" ? queueGuestWeaponSelection(4) : trySelectWeapon(4);
 
   if (event.code.startsWith("Arrow") || event.code.startsWith("Key")) {
     event.preventDefault();
@@ -3955,6 +5241,10 @@ window.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keyup", (event) => {
+  if (isTextEntryTarget(event.target)) {
+    return;
+  }
+
   setMovementKey(event.code, false);
 
   if (event.code.startsWith("Arrow") || event.code.startsWith("Key")) {
@@ -4002,7 +5292,10 @@ canvas.addEventListener("mousedown", (event) => {
 
   if (shopPhaseActive) {
     const readyRect = getShopReadyButtonRect();
-    if (isInsideRect(input.mouseX, input.mouseY, readyRect.x, readyRect.y, readyRect.width, readyRect.height)) {
+    if (
+      multiplayerRole !== "guest" &&
+      isInsideRect(input.mouseX, input.mouseY, readyRect.x, readyRect.y, readyRect.width, readyRect.height)
+    ) {
       endShopPhase();
       return;
     }
@@ -4091,8 +5384,8 @@ function releaseTouch(identifier: number) {
   }
 }
 
-function saveRuntimeSnapshot() {
-  const snapshot: RuntimeSnapshot = {
+function createRuntimeSnapshot(): RuntimeSnapshot {
+  return {
     fighters: structuredClone(fighters),
     bullets: structuredClone(bullets),
     lightningStrikes: structuredClone(lightningStrikes),
@@ -4117,8 +5410,8 @@ function saveRuntimeSnapshot() {
     medkitCooldown,
     starCooldown,
     shieldPickupCooldown,
-    selectedWeapon,
-    highestUnlockedWeapon,
+    selectedWeapon: getPrimaryPlayer()?.selectedWeapon ?? "pistol",
+    highestUnlockedWeapon: getPrimaryPlayer()?.highestUnlockedWeapon ?? "pistol",
     isPaused,
     showRulesMenu,
     rulesScroll,
@@ -4144,13 +5437,95 @@ function saveRuntimeSnapshot() {
     skullBossBurstWindup,
     bossesDefeated
   };
+}
 
+function saveRuntimeSnapshot() {
+  if (multiplayerRole === "guest" || !gameStarted) {
+    return;
+  }
+
+  const snapshot = createRuntimeSnapshot();
   sessionStorage.setItem(LIVE_RELOAD_STATE_KEY, JSON.stringify(snapshot));
+}
+
+function applyRuntimeSnapshot(snapshot: RuntimeSnapshot) {
+  fighters.length = 0;
+  fighters.push(
+    ...snapshot.fighters.map((fighter) => ({
+      ...fighter,
+      controller:
+        fighter.playerSlot === 1 && multiplayerRole === "guest"
+          ? "local"
+          : fighter.playerSlot === 1
+            ? "remote"
+            : fighter.controller ?? "local",
+      selectedWeapon: fighter.selectedWeapon ?? (fighter.playerSlot === 0 ? snapshot.selectedWeapon : "pistol"),
+      highestUnlockedWeapon: fighter.highestUnlockedWeapon ?? (fighter.playerSlot === 0 ? snapshot.highestUnlockedWeapon : "pistol")
+    }))
+  );
+  bullets.length = 0;
+  bullets.push(...snapshot.bullets);
+  lightningStrikes.length = 0;
+  lightningStrikes.push(...snapshot.lightningStrikes);
+  meteors.length = 0;
+  meteors.push(...snapshot.meteors);
+  burningFloors.length = 0;
+  burningFloors.push(...snapshot.burningFloors);
+  medkits.length = 0;
+  medkits.push(...snapshot.medkits);
+  stars.length = 0;
+  stars.push(...snapshot.stars);
+  shieldPickups.length = 0;
+  shieldPickups.push(...snapshot.shieldPickups);
+  explosions.length = 0;
+  explosions.push(...snapshot.explosions);
+  shopItems.length = 0;
+  shopItems.push(...(snapshot.shopItems ?? []));
+  shopPhaseActive = snapshot.shopPhaseActive ?? shopItems.length > 0;
+  swordUpgradeLevel = snapshot.swordUpgradeLevel ?? (snapshot.hasSwordUpgrade ? 1 : 0);
+  regenUpgradeLevel = snapshot.regenUpgradeLevel ?? (snapshot.hasRegenUpgrade ? 1 : 0);
+  attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel ?? (snapshot.hasAttackSpeedUpgrade ? 1 : 0);
+  swordSpawnTimer = snapshot.swordSpawnTimer ?? ORBITAL_SWORD_SPAWN_INTERVAL;
+  regenTickTimer = snapshot.regenTickTimer ?? 1;
+  orbitingSwords.length = 0;
+  orbitingSwords.push(...(snapshot.orbitingSwords ?? []));
+
+  nextId = snapshot.nextId;
+  elapsed = snapshot.elapsed;
+  lightningCooldown = snapshot.lightningCooldown;
+  meteorCooldown = snapshot.meteorCooldown;
+  medkitCooldown = snapshot.medkitCooldown;
+  starCooldown = snapshot.starCooldown;
+  shieldPickupCooldown = snapshot.shieldPickupCooldown;
+  isPaused = snapshot.isPaused;
+  showRulesMenu = snapshot.showRulesMenu;
+  rulesScroll = snapshot.rulesScroll;
+  mobileFullscreenAttempted = snapshot.mobileFullscreenAttempted;
+  pendingRunReset = snapshot.pendingRunReset;
+  devInfiniteHealth = snapshot.devInfiniteHealth;
+  survivalWithoutDeath = snapshot.survivalWithoutDeath;
+  bossFightStarted = snapshot.bossFightStarted;
+  bossFightWon = snapshot.bossFightWon;
+  bossIntroTimer = snapshot.bossIntroTimer;
+  bossAttackType = snapshot.bossAttackType;
+  bossAttackWindup = snapshot.bossAttackWindup;
+  bossAttackActive = snapshot.bossAttackActive;
+  bossAttackRecover = snapshot.bossAttackRecover;
+  bossAttackIndex = snapshot.bossAttackIndex;
+  bossAttackAngle = snapshot.bossAttackAngle;
+  bossAttackHitApplied = snapshot.bossAttackHitApplied;
+  bossSpinDamageTick = snapshot.bossSpinDamageTick;
+  bossSwordContactTick = snapshot.bossSwordContactTick;
+  skullBossActionTimer = snapshot.skullBossActionTimer;
+  skullBossActionIndex = snapshot.skullBossActionIndex;
+  skullBossBurstShotsLeft = snapshot.skullBossBurstShotsLeft;
+  skullBossBurstWindup = snapshot.skullBossBurstWindup;
+  bossesDefeated = snapshot.bossesDefeated;
 }
 
 function restoreRuntimeSnapshot() {
   const raw = sessionStorage.getItem(LIVE_RELOAD_STATE_KEY);
-  if (!raw) {
+  if (!raw || multiplayerRole === "guest") {
     return false;
   }
 
@@ -4160,68 +5535,7 @@ function restoreRuntimeSnapshot() {
       return false;
     }
 
-    fighters.length = 0;
-    fighters.push(...snapshot.fighters);
-    bullets.length = 0;
-    bullets.push(...snapshot.bullets);
-    lightningStrikes.length = 0;
-    lightningStrikes.push(...snapshot.lightningStrikes);
-    meteors.length = 0;
-    meteors.push(...snapshot.meteors);
-    burningFloors.length = 0;
-    burningFloors.push(...snapshot.burningFloors);
-    medkits.length = 0;
-    medkits.push(...snapshot.medkits);
-    stars.length = 0;
-    stars.push(...snapshot.stars);
-    shieldPickups.length = 0;
-    shieldPickups.push(...snapshot.shieldPickups);
-    explosions.length = 0;
-    explosions.push(...snapshot.explosions);
-    shopItems.length = 0;
-    shopItems.push(...(snapshot.shopItems ?? []));
-    shopPhaseActive = snapshot.shopPhaseActive ?? shopItems.length > 0;
-    swordUpgradeLevel = snapshot.swordUpgradeLevel ?? (snapshot.hasSwordUpgrade ? 1 : 0);
-    regenUpgradeLevel = snapshot.regenUpgradeLevel ?? (snapshot.hasRegenUpgrade ? 1 : 0);
-    attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel ?? (snapshot.hasAttackSpeedUpgrade ? 1 : 0);
-    swordSpawnTimer = snapshot.swordSpawnTimer ?? ORBITAL_SWORD_SPAWN_INTERVAL;
-    regenTickTimer = snapshot.regenTickTimer ?? 1;
-    orbitingSwords.length = 0;
-    orbitingSwords.push(...(snapshot.orbitingSwords ?? []));
-
-    nextId = snapshot.nextId;
-    elapsed = snapshot.elapsed;
-    lightningCooldown = snapshot.lightningCooldown;
-    meteorCooldown = snapshot.meteorCooldown;
-    medkitCooldown = snapshot.medkitCooldown;
-    starCooldown = snapshot.starCooldown;
-    shieldPickupCooldown = snapshot.shieldPickupCooldown;
-    selectedWeapon = snapshot.selectedWeapon;
-    highestUnlockedWeapon = snapshot.highestUnlockedWeapon;
-    isPaused = snapshot.isPaused;
-    showRulesMenu = snapshot.showRulesMenu;
-    rulesScroll = snapshot.rulesScroll;
-    mobileFullscreenAttempted = snapshot.mobileFullscreenAttempted;
-    pendingRunReset = snapshot.pendingRunReset;
-    devInfiniteHealth = snapshot.devInfiniteHealth;
-    survivalWithoutDeath = snapshot.survivalWithoutDeath;
-    bossFightStarted = snapshot.bossFightStarted;
-    bossFightWon = snapshot.bossFightWon;
-    bossIntroTimer = snapshot.bossIntroTimer;
-    bossAttackType = snapshot.bossAttackType;
-    bossAttackWindup = snapshot.bossAttackWindup;
-    bossAttackActive = snapshot.bossAttackActive;
-    bossAttackRecover = snapshot.bossAttackRecover;
-    bossAttackIndex = snapshot.bossAttackIndex;
-    bossAttackAngle = snapshot.bossAttackAngle;
-    bossAttackHitApplied = snapshot.bossAttackHitApplied;
-    bossSpinDamageTick = snapshot.bossSpinDamageTick;
-    bossSwordContactTick = snapshot.bossSwordContactTick;
-    skullBossActionTimer = snapshot.skullBossActionTimer;
-    skullBossActionIndex = snapshot.skullBossActionIndex;
-    skullBossBurstShotsLeft = snapshot.skullBossBurstShotsLeft;
-    skullBossBurstWindup = snapshot.skullBossBurstWindup;
-    bossesDefeated = snapshot.bossesDefeated;
+    applyRuntimeSnapshot(snapshot);
     return true;
   } catch {
     return false;
@@ -4259,8 +5573,5 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-if (!restoreRuntimeSnapshot()) {
-  spawnRoster();
-}
 render();
 requestAnimationFrame(frame);
