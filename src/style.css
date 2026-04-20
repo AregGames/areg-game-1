@@ -147,6 +147,26 @@ canvas {
   background: #fff;
 }
 
+.menu-rules {
+  max-height: min(48vh, 360px);
+  margin-top: 14px;
+  padding: 12px;
+  overflow-y: auto;
+  border: 1px solid rgba(255, 230, 186, 0.24);
+  background: rgba(30, 20, 16, 0.72);
+}
+
+.menu-rule-line {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(247, 234, 209, 0.92);
+}
+
+.menu-rule-line:last-child {
+  margin-bottom: 0;
+}
+
 .menu-scanner {
   margin-top: 12px;
 }
