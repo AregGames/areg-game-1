@@ -55,6 +55,24 @@ type WindowWithQrDetector = typeof window & {
 };
 const BarcodeDetectorClass = (window as WindowWithQrDetector).BarcodeDetector;
 
+if (IS_MOBILE_VIEWPORT) {
+  document.addEventListener(
+    "touchmove",
+    (event) => {
+      if (event.touches.length > 1) {
+        event.preventDefault();
+      }
+    },
+    { passive: false }
+  );
+
+  for (const eventName of ["gesturestart", "gesturechange", "gestureend"]) {
+    document.addEventListener(eventName, (event) => {
+      event.preventDefault();
+    });
+  }
+}
+
 canvas.width = WORLD_WIDTH;
 canvas.height = WORLD_HEIGHT;
 
@@ -104,6 +122,9 @@ type Fighter = {
 };
 
 type Bullet = {
+  id: number;
+  shotId: number;
+  sourceInputSeq: number | null;
   x: number;
   y: number;
   vx: number;
@@ -239,6 +260,15 @@ type NetworkPacket =
   | {
       type: "snapshot";
       payload: NetworkSnapshot;
+    }
+  | {
+      type: "shot";
+      payload: {
+        shooterId: number;
+        shooterPlayerSlot: 0 | 1 | null;
+        sourceInputSeq: number | null;
+        bullets: Bullet[];
+      };
     };
 type RuntimeSnapshot = {
   fighters: Fighter[];
@@ -320,6 +350,17 @@ type NetworkSnapshot = {
   bossAttackWindup: number;
   bossAttackAngle: number;
   bossesDefeated: number;
+  serverTick: number;
+  lastProcessedGuestInputSeq: number;
+};
+type BufferedNetworkSnapshot = {
+  snapshot: NetworkSnapshot;
+};
+type GuestPendingInput = {
+  seq: number;
+  dt: number;
+  controls: ControlState;
+  commands: ControlCommandState;
 };
 
 function createControlState(): ControlState {
@@ -341,6 +382,28 @@ function createControlCommandState(): ControlCommandState {
     weaponSlot: null,
     shieldPressed: false,
     ragePressed: false
+  };
+}
+
+function cloneControlState(state: ControlState): ControlState {
+  return {
+    up: state.up,
+    down: state.down,
+    left: state.left,
+    right: state.right,
+    moveX: state.moveX,
+    moveY: state.moveY,
+    shoot: state.shoot,
+    mouseX: state.mouseX,
+    mouseY: state.mouseY
+  };
+}
+
+function cloneControlCommandState(state: ControlCommandState): ControlCommandState {
+  return {
+    weaponSlot: state.weaponSlot,
+    shieldPressed: state.shieldPressed,
+    ragePressed: state.ragePressed
   };
 }
 
@@ -428,11 +491,16 @@ let peerConnection: RTCPeerConnection | null = null;
 let dataChannel: RTCDataChannel | null = null;
 let lastGuestInputSentAt = 0;
 let localInputSequence = 0;
+let lastProcessedRemoteInputSequence = 0;
 let snapshotBroadcastTimer = 0;
-let lastSnapshotReceivedAt = 0;
-let guestInterpolationFromSnapshot: NetworkSnapshot | null = null;
-let guestInterpolationToSnapshot: NetworkSnapshot | null = null;
-let guestInterpolationStartedAt = 0;
+let simulationTick = 0;
+let hostSimulationAccumulator = 0;
+let guestInputAccumulator = 0;
+let guestSnapshotBuffer: BufferedNetworkSnapshot[] = [];
+let guestPendingInputs: GuestPendingInput[] = [];
+let guestPredictedPlayer: Fighter | null = null;
+let guestPredictedBullets: Bullet[] = [];
+let guestAuthoritativeShotBullets: Bullet[] = [];
 let gameStarted = false;
 let menuOpen = true;
 let menuScreen: MenuScreen = "home";
@@ -453,8 +521,12 @@ let scannerAnimationFrameId = 0;
 let scannerStream: MediaStream | null = null;
 let scannerVideo: HTMLVideoElement | null = null;
 const SNAPSHOT_SEND_INTERVAL = 0.12;
-const GUEST_INPUT_SEND_INTERVAL = 0.05;
-const GUEST_SNAPSHOT_INTERPOLATION_MS = Math.max(90, SNAPSHOT_SEND_INTERVAL * 1000);
+const SIMULATION_TICK_RATE = 60;
+const SIMULATION_DT = 1 / SIMULATION_TICK_RATE;
+const MAX_FRAME_DT = 0.1;
+const GUEST_INPUT_SEND_INTERVAL = SIMULATION_DT;
+const GUEST_SNAPSHOT_INTERPOLATION_DELAY_TICKS = Math.max(4, Math.ceil(SNAPSHOT_SEND_INTERVAL / SIMULATION_DT));
+const MAX_GUEST_SNAPSHOT_BUFFER_SIZE = 6;
 const ANSWER_RELAY_KEY_PREFIX = "pixel-bot-brawler:p2p-answer:";
 const rtcConfiguration: RTCConfiguration = {
   iceServers: [
@@ -1486,17 +1558,23 @@ function getPlayerWeapon(score: number): WeaponType {
   return "pistol";
 }
 
-function createBullet(
+function createBulletInArray(
+  target: Bullet[],
   fighter: Fighter,
   direction: number,
   speed: number,
   life: number,
   damage: number,
   size: number,
-  weapon: WeaponType
+  weapon: WeaponType,
+  shotId: number,
+  sourceInputSeq: number | null
 ) {
   const isCrit = fighter.isPlayer && Math.random() < fighter.critChance;
-  bullets.push({
+  const bullet = {
+    id: nextId++,
+    shotId,
+    sourceInputSeq,
     x: fighter.x + Math.cos(direction) * 8,
     y: fighter.y + Math.sin(direction) * 8,
     vx: Math.cos(direction) * speed,
@@ -1509,7 +1587,21 @@ function createBullet(
     weapon,
     isCrit,
     healAmount: 0
-  });
+  };
+  target.push(bullet);
+  return bullet;
+}
+
+function createBullet(
+  fighter: Fighter,
+  direction: number,
+  speed: number,
+  life: number,
+  damage: number,
+  size: number,
+  weapon: WeaponType
+) {
+  createBulletInArray(bullets, fighter, direction, speed, life, damage, size, weapon, nextId++, null);
 }
 
 function getUnlockedWeapons(score: number) {
@@ -1577,10 +1669,56 @@ function activateRage(player: Fighter) {
   playTone("sawtooth", 420, 0.2, 0.04, 820);
 }
 
-function shoot(fighter: Fighter) {
-  if (fighter.reload > 0 || fighter.respawn > 0) {
+function applyControlCommands(player: Fighter, commands: ControlCommandState) {
+  if (commands.weaponSlot !== null) {
+    trySelectWeapon(commands.weaponSlot, player);
+  }
+  if (commands.shieldPressed) {
+    activateShield(player);
+  }
+  if (commands.ragePressed) {
+    activateRage(player);
+  }
+}
+
+function clearControlCommands(commands: ControlCommandState) {
+  commands.weaponSlot = null;
+  commands.shieldPressed = false;
+  commands.ragePressed = false;
+}
+
+function sendAuthoritativeShotEvent(
+  fighter: Fighter,
+  sourceInputSeq: number | null,
+  createdBullets: Bullet[]
+) {
+  if (multiplayerRole !== "host" || !fighter.isPlayer || createdBullets.length <= 0) {
     return;
   }
+
+  sendPacket({
+    type: "shot",
+    payload: {
+      shooterId: fighter.id,
+      shooterPlayerSlot: fighter.playerSlot,
+      sourceInputSeq,
+      bullets: createdBullets.map((bullet) => ({ ...bullet }))
+    }
+  });
+}
+
+function shoot(
+  fighter: Fighter,
+  bulletTarget: Bullet[] = bullets,
+  playSoundEffect = true,
+  sourceInputSeq: number | null = null
+) {
+  if (fighter.reload > 0 || fighter.respawn > 0) {
+    return [];
+  }
+
+  const shotId = nextId++;
+  const createdBullets: Bullet[] = [];
 
   if (fighter.isPlayer) {
     const weapon = getActivePlayerWeapon(fighter);
@@ -1591,38 +1729,69 @@ function shoot(fighter: Fighter) {
 
     if (weapon === "pistol") {
       fighter.reload = (0.2 * rageReloadFactor) / attackSpeedFactor;
-      createBullet(fighter, fighter.dir, 176 * playerSpeedFactor * rageSpeedFactor, 10, 24, 3, weapon);
+      createdBullets.push(
+        createBulletInArray(
+          bulletTarget,
+          fighter,
+          fighter.dir,
+          176 * playerSpeedFactor * rageSpeedFactor,
+          10,
+          24,
+          3,
+          weapon,
+          shotId,
+          sourceInputSeq
+        )
+      );
     } else if (weapon === "shotgun") {
       fighter.reload = (0.28 * rageReloadFactor) / attackSpeedFactor;
-      createBullet(fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
-      createBullet(fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
-      createBullet(fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
-      createBullet(fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
-      createBullet(fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon);
+      createdBullets.push(
+        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
+        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
+        createBulletInArray(bulletTarget, fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
+        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
+        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq)
+      );
     } else if (weapon === "smg") {
       fighter.reload = (0.06 * rageReloadFactor) / attackSpeedFactor;
-      createBullet(
-        fighter,
-        fighter.dir + (Math.random() - 0.5) * 0.12,
-        188 * playerSpeedFactor * rageSpeedFactor,
-        10,
-        14,
-        2,
-        weapon
+      createdBullets.push(
+        createBulletInArray(
+          bulletTarget,
+          fighter,
+          fighter.dir + (Math.random() - 0.5) * 0.12,
+          188 * playerSpeedFactor * rageSpeedFactor,
+          10,
+          14,
+          2,
+          weapon,
+          shotId,
+          sourceInputSeq
+        )
       );
     } else if (weapon === "rifle") {
       fighter.reload = (0.08 * rageReloadFactor) / attackSpeedFactor;
-      createBullet(fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon);
+      createdBullets.push(
+        createBulletInArray(bulletTarget, fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon, shotId, sourceInputSeq)
+      );
     } else {
       fighter.reload = (0.275 * rageReloadFactor) / attackSpeedFactor;
-      createBullet(fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon);
+      createdBullets.push(
+        createBulletInArray(bulletTarget, fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon, shotId, sourceInputSeq)
+      );
     }
   } else {
     fighter.reload = 0.34;
-    createBullet(fighter, fighter.dir, 132, 1.1, 24, 3, "pistol");
+    createdBullets.push(
+      createBulletInArray(bulletTarget, fighter, fighter.dir, 132, 1.1, 24, 3, "pistol", shotId, sourceInputSeq)
+    );
   }
 
-  playShootSound(fighter.isPlayer);
+  if (playSoundEffect) {
+    playShootSound(fighter.isPlayer);
+  }
+
+  sendAuthoritativeShotEvent(fighter, sourceInputSeq, createdBullets);
+  return createdBullets;
 }
 
 function chooseBotTarget(bot: Fighter) {
@@ -1666,23 +1835,19 @@ function consumeQueuedCommands(fighter: Fighter) {
     return;
   }
 
-  if (remoteCommands.weaponSlot !== null) {
-    trySelectWeapon(remoteCommands.weaponSlot, fighter);
-  }
-  if (remoteCommands.shieldPressed) {
-    activateShield(fighter);
-  }
-  if (remoteCommands.ragePressed) {
-    activateRage(fighter);
-  }
-
-  remoteCommands.weaponSlot = null;
-  remoteCommands.shieldPressed = false;
-  remoteCommands.ragePressed = false;
+  applyControlCommands(fighter, remoteCommands);
+  clearControlCommands(remoteCommands);
 }
 
-function updateHumanFighter(player: Fighter, dt: number) {
-  const controls = getControlStateForFighter(player);
+function updateHumanFighterWithControls(
+  player: Fighter,
+  controls: ControlState,
+  dt: number,
+  commands?: ControlCommandState,
+  bulletTarget: Bullet[] = bullets,
+  playShotSound = true,
+  sourceInputSeq: number | null = null
+) {
   const moveX = clamp(Number(controls.right) - Number(controls.left) + controls.moveX, -1, 1);
   const moveY = clamp(Number(controls.down) - Number(controls.up) + controls.moveY, -1, 1);
   const len = Math.hypot(moveX, moveY) || 1;
@@ -1690,13 +1855,158 @@ function updateHumanFighter(player: Fighter, dt: number) {
   player.vy = (moveY / len) * player.speed;
   player.dir = Math.atan2(controls.mouseY - player.y, controls.mouseX - player.x);
 
-  consumeQueuedCommands(player);
+  if (commands) {
+    applyControlCommands(player, commands);
+  }
 
   if (controls.shoot) {
-    shoot(player);
+    shoot(player, bulletTarget, playShotSound, sourceInputSeq);
   }
 
   moveFighter(player, dt);
+}
+
+function updateHumanFighter(player: Fighter, dt: number) {
+  const controls = getControlStateForFighter(player);
+  const commands = player.controller === "remote" ? remoteCommands : undefined;
+  const sourceInputSeq = player.controller === "remote" ? lastProcessedRemoteInputSequence : null;
+  updateHumanFighterWithControls(player, controls, dt, commands, bullets, true, sourceInputSeq);
+  if (player.controller === "remote") {
+    clearControlCommands(remoteCommands);
+  }
+}
+
+function resetGuestPredictionState() {
+  guestPendingInputs = [];
+  guestPredictedPlayer = null;
+  guestPredictedBullets = [];
+  guestAuthoritativeShotBullets = [];
+  lastGuestInputSentAt = 0;
+  localInputSequence = 0;
+  guestInputAccumulator = 0;
+}
+
+function getLatestBufferedGuestSnapshot() {
+  return guestSnapshotBuffer[guestSnapshotBuffer.length - 1]?.snapshot ?? null;
+}
+
+function advancePredictedPlayerTimers(player: Fighter, dt: number) {
+  player.reload = Math.max(0, player.reload - dt);
+  player.flash = Math.max(0, player.flash - dt);
+  player.attackCooldown = Math.max(0, player.attackCooldown - dt);
+  player.shieldTimer = Math.max(0, player.shieldTimer - dt);
+  player.rageTimer = Math.max(0, player.rageTimer - dt);
+  if (player.rageTimer <= 0) {
+    player.rageCooldown = Math.max(0, player.rageCooldown - dt);
+  }
+  if (!player.downed && player.rageTimer <= 0 && player.rageCooldown <= 0) {
+    player.rageCharge = Math.min(100, player.rageCharge + dt * 8);
+  }
+
+  if (player.respawn > 0) {
+    player.respawn = Math.max(0, player.respawn - dt);
+  }
+}
+
+function updateVisualOnlyBullets(target: Bullet[], dt: number) {
+  for (const bullet of target) {
+    bullet.x += bullet.vx * dt;
+    bullet.y += bullet.vy * dt;
+    bullet.life -= dt;
+    if (
+      bullet.x < 0 ||
+      bullet.x > WORLD_WIDTH ||
+      bullet.y < 0 ||
+      bullet.y > WORLD_HEIGHT ||
+      intersectsWall(bullet.x, bullet.y, 2)
+    ) {
+      bullet.life = 0;
+    }
+  }
+
+  for (let index = target.length - 1; index >= 0; index -= 1) {
+    if (target[index].life <= 0) {
+      target.splice(index, 1);
+    }
+  }
+}
+
+function pruneGuestAuthoritativeShotBullets(snapshot: NetworkSnapshot | null) {
+  const snapshotBulletIds = new Set(snapshot?.bullets.map((bullet) => bullet.id) ?? []);
+  guestAuthoritativeShotBullets = guestAuthoritativeShotBullets.filter((bullet) => !snapshotBulletIds.has(bullet.id) && bullet.life > 0);
+}
+
+function applyAuthoritativeShotEvent(payload: Extract<NetworkPacket, { type: "shot" }>["payload"]) {
+  if (multiplayerRole !== "guest") {
+    return;
+  }
+
+  if (payload.shooterPlayerSlot === 1 && payload.sourceInputSeq !== null) {
+    guestPredictedBullets = guestPredictedBullets.filter((bullet) => bullet.sourceInputSeq !== payload.sourceInputSeq);
+  }
+
+  const snapshot = getLatestBufferedGuestSnapshot();
+  const snapshotBulletIds = new Set(snapshot?.bullets.map((bullet) => bullet.id) ?? []);
+  const existingOverlayIds = new Set(guestAuthoritativeShotBullets.map((bullet) => bullet.id));
+
+  for (const bullet of payload.bullets) {
+    if (snapshotBulletIds.has(bullet.id) || existingOverlayIds.has(bullet.id)) {
+      continue;
+    }
+    guestAuthoritativeShotBullets.push({ ...bullet });
+  }
+}
+
+function applyGuestPrediction() {
+  if (multiplayerRole !== "guest") {
+    return;
+  }
+
+  const latestSnapshot = getLatestBufferedGuestSnapshot();
+  if (!latestSnapshot) {
+    guestPredictedPlayer = null;
+    guestPredictedBullets = [];
+    return;
+  }
+
+  const authoritativePlayer = latestSnapshot.fighters.find((fighter) => fighter.isPlayer && fighter.playerSlot === 1);
+  if (!authoritativePlayer) {
+    guestPredictedPlayer = null;
+    guestPredictedBullets = [];
+    return;
+  }
+
+  guestPendingInputs = guestPendingInputs.filter((entry) => entry.seq > latestSnapshot.lastProcessedGuestInputSeq);
+  guestPredictedPlayer = {
+    ...authoritativePlayer,
+    controller: "local"
+  };
+  guestPredictedBullets = [];
+  pruneGuestAuthoritativeShotBullets(latestSnapshot);
+
+  for (const entry of guestPendingInputs) {
+    advancePredictedPlayerTimers(guestPredictedPlayer, entry.dt);
+    if (guestPredictedPlayer.respawn <= 0 && !guestPredictedPlayer.downed) {
+      updateHumanFighterWithControls(
+        guestPredictedPlayer,
+        entry.controls,
+        entry.dt,
+        entry.commands,
+        guestPredictedBullets,
+        false,
+        entry.seq
+      );
+    } else {
+      guestPredictedPlayer.vx = 0;
+      guestPredictedPlayer.vy = 0;
+    }
+    updateVisualOnlyBullets(guestPredictedBullets, entry.dt);
+  }
+
+  const renderedLocalPlayer = getRemotePlayer();
+  if (renderedLocalPlayer) {
+    Object.assign(renderedLocalPlayer, guestPredictedPlayer);
+  }
 }
 
 function updateBot(bot: Fighter, dt: number) {
@@ -1779,7 +2089,11 @@ function updateHelper(helper: Fighter, dt: number) {
       helper.reload = 0.8;
       player.hp = Math.min(player.maxHp, player.hp + 10);
       player.flash = 0.08;
+      const shotId = nextId++;
       bullets.push({
+        id: nextId++,
+        shotId,
+        sourceInputSeq: null,
         x: helper.x,
         y: helper.y,
         vx: Math.cos(helper.dir) * 120,
@@ -1828,7 +2142,11 @@ function updateHelper(helper: Fighter, dt: number) {
 
   if (dist < 140 && helper.reload <= 0) {
     helper.reload = 0.55;
+    const shotId = nextId++;
     bullets.push({
+      id: nextId++,
+      shotId,
+      sourceInputSeq: null,
       x: helper.x + Math.cos(helper.dir) * 8,
       y: helper.y + Math.sin(helper.dir) * 8,
       vx: Math.cos(helper.dir) * 118,
@@ -1993,7 +2311,11 @@ function spawnSkullBossProjectile(boss: Fighter) {
   const angle = Math.atan2(edgeY - boss.y, edgeX - boss.x);
   const arenaRadius = getBossArenaRadius() - 6;
   const speed = 72;
+  const shotId = nextId++;
   bullets.push({
+    id: nextId++,
+    shotId,
+    sourceInputSeq: null,
     x: boss.x + Math.cos(angle) * (boss.radius + 6),
     y: boss.y + Math.sin(angle) * (boss.radius + 6),
     vx: Math.cos(angle) * speed,
@@ -2302,6 +2624,29 @@ function shouldEndRunAfterPlayerDeath(target: Fighter) {
   return !fighters.some((fighter) => fighter.isPlayer && fighter.id !== target.id && isHumanFighterActive(fighter));
 }
 
+function beginFullRunReset() {
+  for (const fighter of fighters) {
+    if (!fighter.isPlayer) {
+      continue;
+    }
+
+    fighter.hp = 0;
+    fighter.vx = 0;
+    fighter.vy = 0;
+    fighter.reload = 0;
+    fighter.attackCooldown = 0;
+    fighter.shieldTimer = 0;
+    fighter.rageTimer = 0;
+    fighter.flash = 0.18;
+    fighter.downed = false;
+    fighter.reviveProgress = 0;
+    fighter.respawn = 2.2;
+  }
+
+  clearRunStateOnPlayerDeath();
+  pendingRunReset = true;
+}
+
 function downPlayer(target: Fighter) {
   target.hp = 0;
   target.vx = 0;
@@ -2314,10 +2659,7 @@ function downPlayer(target: Fighter) {
   target.reviveProgress = 0;
 
   if (shouldEndRunAfterPlayerDeath(target)) {
-    target.downed = false;
-    target.respawn = 2.2;
-    clearRunStateOnPlayerDeath();
-    pendingRunReset = true;
+    beginFullRunReset();
     return;
   }
 
@@ -2775,6 +3117,13 @@ function updateCoopRevives(dt: number) {
   const activeHumans = getActiveHumanFighters();
   const downedHumans = getDownedHumanFighters();
 
+  if (activeHumans.length <= 0 && downedHumans.length > 0) {
+    if (!pendingRunReset) {
+      beginFullRunReset();
+    }
+    return;
+  }
+
   if (activeHumans.length <= 0 || downedHumans.length <= 0) {
     for (const fighter of downedHumans) {
       fighter.reviveProgress = Math.max(0, fighter.reviveProgress - dt * 1.5);
@@ -3207,8 +3556,12 @@ function update(dt: number) {
     if (fighter.respawn > 0) {
       fighter.respawn -= dt;
       if (fighter.respawn <= 0) {
-        if (fighter.isPlayer && fighter.playerSlot === 0 && pendingRunReset) {
-          shouldResetRoster = true;
+        if (fighter.isPlayer && pendingRunReset) {
+          if (fighter.playerSlot === 0) {
+            shouldResetRoster = true;
+          } else {
+            fighter.respawn = 0;
+          }
         } else {
           respawn(fighter);
         }
@@ -3855,7 +4208,36 @@ function drawExplosions() {
 }
 
 function drawBullets() {
+  const unresolvedLocalShotSeqs = new Set(
+    guestPredictedBullets
+      .map((bullet) => bullet.sourceInputSeq)
+      .filter((sourceInputSeq): sourceInputSeq is number => sourceInputSeq !== null)
+  );
+
   for (const bullet of bullets) {
+    if (bullet.sourceInputSeq !== null && unresolvedLocalShotSeqs.has(bullet.sourceInputSeq)) {
+      continue;
+    }
+    ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
+    ctx.fillRect(
+      bullet.x - bullet.size / 2,
+      bullet.y - bullet.size / 2,
+      bullet.size,
+      bullet.size
+    );
+  }
+
+  for (const bullet of guestAuthoritativeShotBullets) {
+    ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
+    ctx.fillRect(
+      bullet.x - bullet.size / 2,
+      bullet.y - bullet.size / 2,
+      bullet.size,
+      bullet.size
+    );
+  }
+
+  for (const bullet of guestPredictedBullets) {
     ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
     ctx.fillRect(
       bullet.x - bullet.size / 2,
@@ -4249,6 +4631,8 @@ function startSoloGame() {
   disconnectMultiplayer(false);
   gameStarted = true;
   isPaused = false;
+  hostSimulationAccumulator = 0;
+  guestInputAccumulator = 0;
   spawnRoster();
   closeMenu();
 }
@@ -4256,6 +4640,8 @@ function startSoloGame() {
 function startConnectedGame() {
   gameStarted = true;
   isPaused = false;
+  hostSimulationAccumulator = 0;
+  guestInputAccumulator = 0;
   closeMenu();
 }
 
@@ -4578,16 +4964,13 @@ function scheduleConnectionTimeout(role: MultiplayerRole) {
 }
 
 function clearOutgoingGuestCommands() {
-  outgoingGuestCommands.weaponSlot = null;
-  outgoingGuestCommands.shieldPressed = false;
-  outgoingGuestCommands.ragePressed = false;
+  clearControlCommands(outgoingGuestCommands);
 }
 
 function resetRemoteControlState() {
   Object.assign(remoteInput, createControlState());
-  remoteCommands.weaponSlot = null;
-  remoteCommands.shieldPressed = false;
-  remoteCommands.ragePressed = false;
+  clearControlCommands(remoteCommands);
+  lastProcessedRemoteInputSequence = 0;
 }
 
 function sendPacket(packet: NetworkPacket) {
@@ -4606,11 +4989,17 @@ function handleNetworkPacket(raw: string) {
       remoteCommands.weaponSlot = packet.payload.weaponSlot;
       remoteCommands.shieldPressed = packet.payload.shieldPressed;
       remoteCommands.ragePressed = packet.payload.ragePressed;
+      lastProcessedRemoteInputSequence = Math.max(lastProcessedRemoteInputSequence, packet.payload.seq);
       return;
     }
 
     if (packet.type === "snapshot" && multiplayerRole === "guest") {
       queueGuestSnapshot(packet.payload);
+      return;
+    }
+
+    if (packet.type === "shot" && multiplayerRole === "guest") {
+      applyAuthoritativeShotEvent(packet.payload);
     }
   } catch {
     setNetworkBanner("error", "Received invalid network packet");
@@ -4834,6 +5223,9 @@ function disconnectMultiplayer(showMenu = true) {
   closeNetworkConnection();
   resetRemoteControlState();
   clearOutgoingGuestCommands();
+  resetGuestPredictionState();
+  hostSimulationAccumulator = 0;
+  simulationTick = 0;
   removeRemotePlayer();
   multiplayerRole = "solo";
   pendingSessionId = "";
@@ -4865,22 +5257,25 @@ function maybeBroadcastSnapshot(dt: number) {
   });
 }
 
-function maybeSendGuestInput(now: number) {
+function maybeSendGuestInput() {
   if (multiplayerRole !== "guest" || !dataChannel || dataChannel.readyState !== "open") {
     return;
   }
 
-  if (now - lastGuestInputSentAt < GUEST_INPUT_SEND_INTERVAL * 1000) {
-    return;
-  }
-
-  lastGuestInputSentAt = now;
   localInputSequence += 1;
+  const commands = cloneControlCommandState(outgoingGuestCommands);
+  const controls = cloneControlState(input);
+  guestPendingInputs.push({
+    seq: localInputSequence,
+    dt: GUEST_INPUT_SEND_INTERVAL,
+    controls,
+    commands
+  });
   sendPacket({
     type: "input",
     payload: {
-      ...input,
-      ...outgoingGuestCommands,
+      ...controls,
+      ...commands,
       seq: localInputSequence
     }
   });
@@ -5124,15 +5519,29 @@ processIncomingRoute();
 let previous = performance.now();
 
 function frame(now: number) {
-  const dt = Math.min(0.033, (now - previous) / 1000);
+  const frameDt = Math.min(MAX_FRAME_DT, (now - previous) / 1000);
   previous = now;
-  if (gameStarted && multiplayerRole !== "guest" && !isPaused) {
-    update(dt);
+
+  if (gameStarted && !isPaused) {
+    if (multiplayerRole !== "guest") {
+      hostSimulationAccumulator += frameDt;
+      while (hostSimulationAccumulator >= SIMULATION_DT) {
+        hostSimulationAccumulator -= SIMULATION_DT;
+        simulationTick += 1;
+        update(SIMULATION_DT);
+      }
+    } else {
+      guestInputAccumulator += frameDt;
+      while (guestInputAccumulator >= GUEST_INPUT_SEND_INTERVAL) {
+        guestInputAccumulator -= GUEST_INPUT_SEND_INTERVAL;
+        maybeSendGuestInput();
+      }
+      advanceGuestSnapshotInterpolation(now);
+      applyGuestPrediction();
+      updateVisualOnlyBullets(guestAuthoritativeShotBullets, frameDt);
+    }
   }
-  if (gameStarted && multiplayerRole === "guest" && !isPaused) {
-    advanceGuestSnapshotInterpolation(now);
-  }
-  maybeSendGuestInput(now);
+
   render();
   requestAnimationFrame(frame);
 }
@@ -5754,7 +6163,9 @@ function createNetworkSnapshot(): NetworkSnapshot {
     bossAttackType,
     bossAttackWindup,
     bossAttackAngle,
-    bossesDefeated
+    bossesDefeated,
+    serverTick: simulationTick,
+    lastProcessedGuestInputSeq: lastProcessedRemoteInputSequence
   };
 }
 
@@ -5923,45 +6334,55 @@ function applyInterpolatedNetworkSnapshot(fromSnapshot: NetworkSnapshot, toSnaps
 }
 
 function resetGuestSnapshotInterpolation() {
-  guestInterpolationFromSnapshot = null;
-  guestInterpolationToSnapshot = null;
-  guestInterpolationStartedAt = 0;
-  lastSnapshotReceivedAt = 0;
+  guestSnapshotBuffer = [];
+  resetGuestPredictionState();
 }
 
 function queueGuestSnapshot(snapshot: NetworkSnapshot) {
-  const now = performance.now();
-
-  if (!gameStarted || lastSnapshotReceivedAt <= 0) {
+  if (!gameStarted) {
     resetGuestSnapshotInterpolation();
-    guestInterpolationToSnapshot = snapshot;
-    lastSnapshotReceivedAt = now;
-    applyNetworkSnapshot(snapshot);
+  }
+
+  const latestBufferedSnapshot = guestSnapshotBuffer[guestSnapshotBuffer.length - 1];
+  if (latestBufferedSnapshot && snapshot.serverTick <= latestBufferedSnapshot.snapshot.serverTick) {
     return;
   }
 
-  guestInterpolationFromSnapshot = createNetworkSnapshot();
-  guestInterpolationToSnapshot = snapshot;
-  guestInterpolationStartedAt = now;
-  lastSnapshotReceivedAt = now;
+  guestSnapshotBuffer.push({
+    snapshot
+  });
+
+  if (guestSnapshotBuffer.length > MAX_GUEST_SNAPSHOT_BUFFER_SIZE) {
+    guestSnapshotBuffer.splice(0, guestSnapshotBuffer.length - MAX_GUEST_SNAPSHOT_BUFFER_SIZE);
+  }
+
+  if (guestSnapshotBuffer.length === 1) {
+    applyNetworkSnapshot(snapshot);
+  }
 }
 
 function advanceGuestSnapshotInterpolation(now: number) {
-  if (multiplayerRole !== "guest" || !guestInterpolationToSnapshot) {
+  if (multiplayerRole !== "guest" || guestSnapshotBuffer.length === 0) {
     return;
   }
 
-  if (!guestInterpolationFromSnapshot) {
-    applyNetworkSnapshot(guestInterpolationToSnapshot);
+  if (guestSnapshotBuffer.length === 1) {
+    applyNetworkSnapshot(guestSnapshotBuffer[0].snapshot);
     return;
   }
 
-  const alpha = Math.min(1, (now - guestInterpolationStartedAt) / GUEST_SNAPSHOT_INTERPOLATION_MS);
-  applyInterpolatedNetworkSnapshot(guestInterpolationFromSnapshot, guestInterpolationToSnapshot, alpha);
+  const latestSnapshot = guestSnapshotBuffer[guestSnapshotBuffer.length - 1].snapshot;
+  const renderTick = latestSnapshot.serverTick - GUEST_SNAPSHOT_INTERPOLATION_DELAY_TICKS;
 
-  if (alpha >= 1) {
-    guestInterpolationFromSnapshot = null;
+  while (guestSnapshotBuffer.length >= 3 && guestSnapshotBuffer[1].snapshot.serverTick <= renderTick) {
+    guestSnapshotBuffer.shift();
   }
+
+  const fromEntry = guestSnapshotBuffer[0];
+  const toEntry = guestSnapshotBuffer[1];
+  const interval = Math.max(1, toEntry.snapshot.serverTick - fromEntry.snapshot.serverTick);
+  const alpha = clamp((renderTick - fromEntry.snapshot.serverTick) / interval, 0, 1);
+  applyInterpolatedNetworkSnapshot(fromEntry.snapshot, toEntry.snapshot, alpha);
 }
 
 function restoreRuntimeSnapshot() {
