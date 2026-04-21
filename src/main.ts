@@ -497,6 +497,7 @@ let simulationTick = 0;
 let hostSimulationAccumulator = 0;
 let guestInputAccumulator = 0;
 let guestSnapshotBuffer: BufferedNetworkSnapshot[] = [];
+let guestEstimatedServerTick = 0;
 let guestPendingInputs: GuestPendingInput[] = [];
 let guestPredictedPlayer: Fighter | null = null;
 let guestPredictedBullets: Bullet[] = [];
@@ -520,7 +521,7 @@ let scannerBusy = false;
 let scannerAnimationFrameId = 0;
 let scannerStream: MediaStream | null = null;
 let scannerVideo: HTMLVideoElement | null = null;
-const SNAPSHOT_SEND_INTERVAL = 0.12;
+const SNAPSHOT_SEND_INTERVAL = 1 / 20;
 const SIMULATION_TICK_RATE = 60;
 const SIMULATION_DT = 1 / SIMULATION_TICK_RATE;
 const MAX_FRAME_DT = 0.1;
@@ -1558,6 +1559,34 @@ function getPlayerWeapon(score: number): WeaponType {
   return "pistol";
 }
 
+function deterministicRandom(seed: number, salt: number) {
+  let value = (seed ^ salt) >>> 0;
+  value = Math.imul(value ^ 0x9e3779b9, 0x85ebca6b) >>> 0;
+  value ^= value >>> 13;
+  value = Math.imul(value, 0xc2b2ae35) >>> 0;
+  value ^= value >>> 16;
+  return value / 0xffffffff;
+}
+
+function getShotSpreadOffset(sourceInputSeq: number | null, projectileIndex: number, amount: number) {
+  if (sourceInputSeq === null) {
+    return (Math.random() - 0.5) * amount;
+  }
+
+  return (deterministicRandom(sourceInputSeq, 31 + projectileIndex) - 0.5) * amount;
+}
+
+function rollBulletCrit(fighter: Fighter, sourceInputSeq: number | null, projectileIndex: number) {
+  if (!fighter.isPlayer) {
+    return false;
+  }
+
+  const roll = sourceInputSeq === null
+    ? Math.random()
+    : deterministicRandom(sourceInputSeq, 101 + projectileIndex);
+  return roll < fighter.critChance;
+}
+
 function createBulletInArray(
   target: Bullet[],
   fighter: Fighter,
@@ -1568,9 +1597,10 @@ function createBulletInArray(
   size: number,
   weapon: WeaponType,
   shotId: number,
-  sourceInputSeq: number | null
+  sourceInputSeq: number | null,
+  projectileIndex: number
 ) {
-  const isCrit = fighter.isPlayer && Math.random() < fighter.critChance;
+  const isCrit = rollBulletCrit(fighter, sourceInputSeq, projectileIndex);
   const bullet = {
     id: nextId++,
     shotId,
@@ -1601,7 +1631,7 @@ function createBullet(
   size: number,
   weapon: WeaponType
 ) {
-  createBulletInArray(bullets, fighter, direction, speed, life, damage, size, weapon, nextId++, null);
+  createBulletInArray(bullets, fighter, direction, speed, life, damage, size, weapon, nextId++, null, 0);
 }
 
 function getUnlockedWeapons(score: number) {
@@ -1740,17 +1770,18 @@ function shoot(
           3,
           weapon,
           shotId,
-          sourceInputSeq
+          sourceInputSeq,
+          0
         )
       );
     } else if (weapon === "shotgun") {
       fighter.reload = (0.28 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
-        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
-        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
-        createBulletInArray(bulletTarget, fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
-        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq),
-        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq)
+        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 0),
+        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 1),
+        createBulletInArray(bulletTarget, fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 2),
+        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 3),
+        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 4)
       );
     } else if (weapon === "smg") {
       fighter.reload = (0.06 * rageReloadFactor) / attackSpeedFactor;
@@ -1758,31 +1789,32 @@ function shoot(
         createBulletInArray(
           bulletTarget,
           fighter,
-          fighter.dir + (Math.random() - 0.5) * 0.12,
+          fighter.dir + getShotSpreadOffset(sourceInputSeq, 0, 0.12),
           188 * playerSpeedFactor * rageSpeedFactor,
           10,
           14,
           2,
           weapon,
           shotId,
-          sourceInputSeq
+          sourceInputSeq,
+          0
         )
       );
     } else if (weapon === "rifle") {
       fighter.reload = (0.08 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
-        createBulletInArray(bulletTarget, fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon, shotId, sourceInputSeq)
+        createBulletInArray(bulletTarget, fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon, shotId, sourceInputSeq, 0)
       );
     } else {
       fighter.reload = (0.275 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
-        createBulletInArray(bulletTarget, fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon, shotId, sourceInputSeq)
+        createBulletInArray(bulletTarget, fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon, shotId, sourceInputSeq, 0)
       );
     }
   } else {
     fighter.reload = 0.34;
     createdBullets.push(
-      createBulletInArray(bulletTarget, fighter, fighter.dir, 132, 1.1, 24, 3, "pistol", shotId, sourceInputSeq)
+      createBulletInArray(bulletTarget, fighter, fighter.dir, 132, 1.1, 24, 3, "pistol", shotId, sourceInputSeq, 0)
     );
   }
 
@@ -1877,6 +1909,7 @@ function updateHumanFighter(player: Fighter, dt: number) {
 }
 
 function resetGuestPredictionState() {
+  guestEstimatedServerTick = 0;
   guestPendingInputs = [];
   guestPredictedPlayer = null;
   guestPredictedBullets = [];
@@ -5536,7 +5569,7 @@ function frame(now: number) {
         guestInputAccumulator -= GUEST_INPUT_SEND_INTERVAL;
         maybeSendGuestInput();
       }
-      advanceGuestSnapshotInterpolation(now);
+      advanceGuestSnapshotInterpolation(frameDt);
       applyGuestPrediction();
       updateVisualOnlyBullets(guestAuthoritativeShotBullets, frameDt);
     }
@@ -6343,6 +6376,12 @@ function queueGuestSnapshot(snapshot: NetworkSnapshot) {
     resetGuestSnapshotInterpolation();
   }
 
+  if (guestSnapshotBuffer.length === 0) {
+    guestEstimatedServerTick = snapshot.serverTick;
+  } else {
+    guestEstimatedServerTick = Math.max(guestEstimatedServerTick, snapshot.serverTick);
+  }
+
   const latestBufferedSnapshot = guestSnapshotBuffer[guestSnapshotBuffer.length - 1];
   if (latestBufferedSnapshot && snapshot.serverTick <= latestBufferedSnapshot.snapshot.serverTick) {
     return;
@@ -6361,10 +6400,12 @@ function queueGuestSnapshot(snapshot: NetworkSnapshot) {
   }
 }
 
-function advanceGuestSnapshotInterpolation(now: number) {
+function advanceGuestSnapshotInterpolation(frameDt: number) {
   if (multiplayerRole !== "guest" || guestSnapshotBuffer.length === 0) {
     return;
   }
+
+  guestEstimatedServerTick += frameDt * SIMULATION_TICK_RATE;
 
   if (guestSnapshotBuffer.length === 1) {
     applyNetworkSnapshot(guestSnapshotBuffer[0].snapshot);
@@ -6372,7 +6413,8 @@ function advanceGuestSnapshotInterpolation(now: number) {
   }
 
   const latestSnapshot = guestSnapshotBuffer[guestSnapshotBuffer.length - 1].snapshot;
-  const renderTick = latestSnapshot.serverTick - GUEST_SNAPSHOT_INTERPOLATION_DELAY_TICKS;
+  guestEstimatedServerTick = Math.max(guestEstimatedServerTick, latestSnapshot.serverTick);
+  const renderTick = guestEstimatedServerTick - GUEST_SNAPSHOT_INTERPOLATION_DELAY_TICKS;
 
   while (guestSnapshotBuffer.length >= 3 && guestSnapshotBuffer[1].snapshot.serverTick <= renderTick) {
     guestSnapshotBuffer.shift();
