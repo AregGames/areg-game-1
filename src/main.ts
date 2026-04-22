@@ -20,6 +20,9 @@ const BOSS1_SHIELD_RADIUS_SCALE = 0.7;
 const BOSS1_SHIELD_SPIN_SPEED = 1.7;
 const BOSS1_SHIELD_ARC_PORTION = 0.3;
 const BOSS1_SHIELD_LINE_WIDTH = 3;
+const BOSS1_SPIN_DURATION = 5.5;
+const BOSS1_SPIN_DAMAGE_INTERVAL = 0.28;
+const BOSS1_SWORD_CONTACT_INTERVAL = 0.18;
 const SKULL_BOSS_PROJECTILE_WINDUP = 0.05;
 const MAX_SIMULTANEOUS_ENEMIES = 15;
 const NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE = 0.5;
@@ -1207,6 +1210,51 @@ function configureSkullBoss(boss: Fighter) {
   boss.attackCooldown = 0;
 }
 
+function startIronBossSpin(boss: Fighter) {
+  bossIntroTimer = BOSS1_SPIN_DURATION;
+  bossAttackType = null;
+  bossAttackWindup = 0;
+  bossAttackActive = 0;
+  bossAttackRecover = 0;
+  bossAttackIndex = 0;
+  bossAttackAngle = boss.dir;
+  bossAttackHitApplied = false;
+  bossSpinDamageTick = BOSS1_SPIN_DAMAGE_INTERVAL;
+  bossSwordContactTick = BOSS1_SWORD_CONTACT_INTERVAL;
+}
+
+function placeFighterAt(fighter: Fighter, x: number, y: number) {
+  fighter.x = x;
+  fighter.y = y;
+  fighter.spawnX = x;
+  fighter.spawnY = y;
+  fighter.targetX = x;
+  fighter.targetY = y;
+  fighter.vx = 0;
+  fighter.vy = 0;
+  fighter.wander = 0;
+}
+
+function moveAlliesToBossArena(activeHumans: Fighter[]) {
+  if (activeHumans.length <= 0) {
+    return;
+  }
+
+  const helpers = fighters.filter((fighter) => fighter.team === "ally" && fighter.respawn <= 0);
+  const helperOffsets = [
+    { x: -24, y: 18 },
+    { x: 24, y: 18 },
+    { x: -36, y: 2 },
+    { x: 36, y: 2 }
+  ];
+
+  for (let index = 0; index < helpers.length; index += 1) {
+    const anchor = activeHumans[index % activeHumans.length];
+    const offset = helperOffsets[index % helperOffsets.length];
+    placeFighterAt(helpers[index], anchor.x + offset.x, anchor.y + offset.y);
+  }
+}
+
 function startBossFight(kind: BossKind) {
   if (bossFightStarted || bossFightWon) {
     return;
@@ -1215,12 +1263,11 @@ function startBossFight(kind: BossKind) {
   despawnEnemies();
   clearAmbientHazards();
 
-  for (const player of getActiveHumanFighters()) {
-    player.x = WORLD_WIDTH / 2 + (player.playerSlot === 1 ? 20 : -20);
-    player.y = WORLD_HEIGHT / 2 + 58;
-    player.vx = 0;
-    player.vy = 0;
+  const activeHumans = getActiveHumanFighters();
+  for (const player of activeHumans) {
+    placeFighterAt(player, WORLD_WIDTH / 2 + (player.playerSlot === 1 ? 20 : -20), WORLD_HEIGHT / 2 + 58);
   }
+  moveAlliesToBossArena(activeHumans);
 
   const boss = createFighter(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, false, 1);
   if (kind === "skull") {
@@ -1231,7 +1278,7 @@ function startBossFight(kind: BossKind) {
   fighters.push(boss);
 
   bossFightStarted = true;
-  bossIntroTimer = kind === "iron" ? 5.5 : 0;
+  bossIntroTimer = 0;
   bossAttackType = null;
   bossAttackWindup = 0;
   bossAttackActive = 0;
@@ -1239,12 +1286,16 @@ function startBossFight(kind: BossKind) {
   bossAttackIndex = 0;
   bossAttackAngle = boss.dir;
   bossAttackHitApplied = false;
-  bossSpinDamageTick = kind === "iron" ? 0.28 : 0;
-  bossSwordContactTick = kind === "iron" ? 0.18 : 0;
+  bossSpinDamageTick = 0;
+  bossSwordContactTick = 0;
   skullBossActionTimer = kind === "skull" ? 1.25 : 0;
   skullBossActionIndex = 0;
   skullBossBurstShotsLeft = 0;
   skullBossBurstWindup = 0;
+
+  if (kind === "iron") {
+    startIronBossSpin(boss);
+  }
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -1660,11 +1711,6 @@ function getActivePlayerWeapon(player: Fighter) {
 }
 
 function createHelper(type: "red" | "green", player: Fighter) {
-  const activeHelpers = fighters.filter((fighter) => fighter.team === "ally" && fighter.respawn <= 0);
-  if (activeHelpers.length >= 2) {
-    return;
-  }
-
   const helper = createFighter(player.x + 12, player.y + 12, false, type === "red" ? 2 : 3);
   helper.team = "ally";
   helper.helperType = type;
@@ -2497,7 +2543,7 @@ function updateBoss(boss: Fighter, dt: number) {
 
     if (bossSpinDamageTick <= 0) {
       damageTargetsTouchingBossSword(boss, 12, 0);
-      bossSpinDamageTick = 0.28;
+      bossSpinDamageTick = BOSS1_SPIN_DAMAGE_INTERVAL;
     }
 
     if (bossIntroTimer <= 0) {
@@ -2528,13 +2574,20 @@ function updateBoss(boss: Fighter, dt: number) {
 
   bossAttackRecover = Math.max(0, bossAttackRecover - dt);
   if (bossAttackRecover <= 0) {
-    bossAttackIndex = (bossAttackIndex + 1) % bossAttackPattern.length;
+    bossAttackIndex += 1;
+    if (bossAttackIndex >= bossAttackPattern.length) {
+      startIronBossSpin(boss);
+      return;
+    }
+
     queueBossAttack(boss, player);
   }
 }
 
-function reflectBulletOffBoss(bullet: Bullet, boss: Fighter) {
-  const player = getNearestActiveHuman(boss.x, boss.y)
+function reflectBulletOffBoss(bullet: Bullet, boss: Fighter, originalOwner: Fighter | null) {
+  const player = originalOwner?.team === "ally" && isFighterActive(originalOwner)
+    ? originalOwner
+    : getNearestActiveHuman(boss.x, boss.y)
     ?? getBossTargets()[0]
     ?? null;
 
@@ -2953,7 +3006,7 @@ function updateBullets(dt: number) {
       owner.team !== "enemy" &&
       bulletHitsBoss1Shield(bullet, boss)
     ) {
-      reflectBulletOffBoss(bullet, boss);
+      reflectBulletOffBoss(bullet, boss, owner);
       continue;
     }
 
@@ -5824,6 +5877,22 @@ window.addEventListener("keydown", (event) => {
       activateRage(player);
     }
     event.preventDefault();
+  }
+  if (event.code === "Digit0" || event.code === "Numpad0") {
+    const player = getControlledPlayer();
+    if (multiplayerRole !== "guest" && player && !isPaused) {
+      createHelper("red", player);
+    }
+    event.preventDefault();
+    return;
+  }
+  if (event.code === "Digit9" || event.code === "Numpad9") {
+    const player = getControlledPlayer();
+    if (multiplayerRole !== "guest" && player && !isPaused) {
+      createHelper("green", player);
+    }
+    event.preventDefault();
+    return;
   }
   if (event.code === "Digit1") multiplayerRole === "guest" ? queueGuestWeaponSelection(0) : trySelectWeapon(0);
   if (event.code === "Digit2") multiplayerRole === "guest" ? queueGuestWeaponSelection(1) : trySelectWeapon(1);
