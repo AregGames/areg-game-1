@@ -29,6 +29,8 @@ const NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE = 0.5;
 const SHOP_ITEM_COST_SWORDS = 20;
 const SHOP_ITEM_COST_REGEN = 20;
 const SHOP_ITEM_COST_ATTACK_SPEED = 30;
+const SHOP_ITEM_COST_PIERCE = 15;
+const SHOP_ITEM_COST_SHOCKWAVE = 20;
 const PLAYER_ATTACK_SPEED_MULTIPLIER = 1.25;
 const ORBITAL_SWORD_SPAWN_INTERVAL = 10;
 const ORBITAL_SWORD_DURATION = 3.5;
@@ -40,6 +42,8 @@ const ORBITAL_SWORD_DAMAGE_TICK = 0.25;
 const REGEN_AMOUNT_PER_SECOND = 3;
 const AUDIO_MASTER_GAIN = 0.42;
 const SHOP_DENY_SOUND_COOLDOWN = 0.3;
+const KNOCKBACK_VELOCITY_SCALE = 10;
+const KNOCKBACK_DECAY = 16;
 const SHOP_READY_BUTTON_WIDTH = 78;
 const SHOP_READY_BUTTON_HEIGHT = 16;
 const DEBUG_SHOP_POINTS_BONUS = 10;
@@ -85,6 +89,8 @@ type Fighter = {
   y: number;
   vx: number;
   vy: number;
+  knockbackVx: number;
+  knockbackVy: number;
   dir: number;
   radius: number;
   speed: number;
@@ -140,6 +146,10 @@ type Bullet = {
   weapon: WeaponType;
   isCrit: boolean;
   healAmount: number;
+  trailLength?: number;
+  piercedTargetIds?: string;
+  laserResolved?: boolean;
+  canPierce?: boolean;
 };
 
 type Wall = {
@@ -149,7 +159,7 @@ type Wall = {
   h: number;
 };
 
-type WeaponType = "pistol" | "shotgun" | "smg" | "rifle" | "bazooka";
+type WeaponType = "pistol" | "shotgun" | "smg" | "laser" | "bazooka";
 
 type LightningStrike = {
   x: number;
@@ -207,7 +217,7 @@ type Explosion = {
 type ShopItem = {
   x: number;
   y: number;
-  itemType: "swords" | "regen" | "attackSpeed";
+  itemType: "swords" | "regen" | "attackSpeed" | "pierce" | "shockwave";
   cost: number;
 };
 
@@ -288,6 +298,8 @@ type RuntimeSnapshot = {
   swordUpgradeLevel: number;
   regenUpgradeLevel: number;
   attackSpeedUpgradeLevel: number;
+  fourthShotPierceUnlocked?: boolean;
+  fourthShotPierceCounter?: number;
   hasSwordUpgrade?: boolean;
   hasRegenUpgrade?: boolean;
   hasAttackSpeedUpgrade?: boolean;
@@ -344,6 +356,8 @@ type NetworkSnapshot = {
   swordUpgradeLevel: number;
   regenUpgradeLevel: number;
   attackSpeedUpgradeLevel: number;
+  fourthShotPierceUnlocked: boolean;
+  fourthShotPierceCounter: number;
   elapsed: number;
   survivalWithoutDeath: number;
   bossFightStarted: boolean;
@@ -456,10 +470,12 @@ let shopPhaseActive = false;
 let swordUpgradeLevel = 0;
 let regenUpgradeLevel = 0;
 let attackSpeedUpgradeLevel = 0;
+let fourthShotPierceUnlocked = false;
+let fourthShotPierceCounter = 0;
 let swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
 let regenTickTimer = 1;
 const orbitingSwords: OrbitingSword[] = [];
-const weaponOrder: WeaponType[] = ["pistol", "smg", "shotgun", "rifle", "bazooka"];
+const weaponOrder: WeaponType[] = ["pistol", "smg", "shotgun", "laser", "bazooka"];
 let isPaused = false;
 let showRulesMenu = false;
 let rulesScroll = 0;
@@ -757,6 +773,8 @@ function createFighter(x: number, y: number, isPlayer: boolean, colorIndex: numb
     y,
     vx: 0,
     vy: 0,
+    knockbackVx: 0,
+    knockbackVy: 0,
     dir: 0,
     radius: 7,
     speed: isPlayer ? 66 : 50,
@@ -986,6 +1004,8 @@ function spawnRoster() {
   swordUpgradeLevel = 0;
   regenUpgradeLevel = 0;
   attackSpeedUpgradeLevel = 0;
+  fourthShotPierceUnlocked = false;
+  fourthShotPierceCounter = 0;
   swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = 1;
   shopDenySoundCooldown = 0;
@@ -1232,6 +1252,8 @@ function placeFighterAt(fighter: Fighter, x: number, y: number) {
   fighter.targetY = y;
   fighter.vx = 0;
   fighter.vy = 0;
+  fighter.knockbackVx = 0;
+  fighter.knockbackVy = 0;
   fighter.wander = 0;
 }
 
@@ -1401,6 +1423,8 @@ function respawn(fighter: Fighter) {
   fighter.y = point.y;
   fighter.vx = 0;
   fighter.vy = 0;
+  fighter.knockbackVx = 0;
+  fighter.knockbackVy = 0;
   if (fighter.isPlayer) {
     fighter.downed = false;
     fighter.reviveProgress = 0;
@@ -1604,7 +1628,7 @@ function playShopDeniedSound() {
 
 function getPlayerWeapon(score: number): WeaponType {
   if (score >= 20) return "bazooka";
-  if (score >= 15) return "rifle";
+  if (score >= 15) return "laser";
   if (score >= 10) return "shotgun";
   if (score >= 5) return "smg";
   return "pistol";
@@ -1662,12 +1686,15 @@ function createBulletInArray(
     vy: Math.sin(direction) * speed,
     ownerId: fighter.id,
     life,
-    color: fighter.accent,
+    color: weapon === "laser" ? "#66f6ff" : fighter.accent,
     damage: (isCrit ? damage * 2 : damage) * fighter.damageMultiplier,
     size,
     weapon,
     isCrit,
-    healAmount: 0
+    healAmount: 0,
+    trailLength: weapon === "laser" ? 0 : undefined,
+    piercedTargetIds: weapon === "laser" ? "" : undefined,
+    laserResolved: weapon === "laser" ? false : undefined
   };
   target.push(bullet);
   return bullet;
@@ -1690,9 +1717,68 @@ function getUnlockedWeapons(score: number) {
     if (weapon === "pistol") return true;
     if (weapon === "smg") return score >= 5;
     if (weapon === "shotgun") return score >= 10;
-    if (weapon === "rifle") return score >= 15;
+    if (weapon === "laser") return score >= 15;
     return score >= 20;
   });
+}
+
+function traceProjectilePath(startX: number, startY: number, endX: number, endY: number, radius: number) {
+  const distance = Math.hypot(endX - startX, endY - startY);
+  const steps = Math.max(1, Math.ceil(distance / 2));
+  let lastX = startX;
+  let lastY = startY;
+
+  for (let step = 1; step <= steps; step += 1) {
+    const t = step / steps;
+    const x = startX + (endX - startX) * t;
+    const y = startY + (endY - startY) * t;
+    if (x < 0 || x > WORLD_WIDTH || y < 0 || y > WORLD_HEIGHT || intersectsWall(x, y, radius)) {
+      return { x: lastX, y: lastY, hitObstacle: true };
+    }
+    lastX = x;
+    lastY = y;
+  }
+
+  return { x: endX, y: endY, hitObstacle: false };
+}
+
+function hasPiercedTarget(bullet: Bullet, targetId: number) {
+  return bullet.piercedTargetIds?.includes(`|${targetId}|`) ?? false;
+}
+
+function markPiercedTarget(bullet: Bullet, targetId: number) {
+  bullet.piercedTargetIds = `${bullet.piercedTargetIds ?? ""}|${targetId}|`;
+}
+
+function resolveLaserBeam(bullet: Bullet, dt: number) {
+  if (bullet.laserResolved) {
+    return {
+      previousX: bullet.x,
+      previousY: bullet.y,
+      hitObstacle: false
+    };
+  }
+
+  const previousX = bullet.x;
+  const previousY = bullet.y;
+  const tracedPath = traceProjectilePath(
+    previousX,
+    previousY,
+    bullet.x + bullet.vx * dt,
+    bullet.y + bullet.vy * dt,
+    Math.max(2, bullet.size)
+  );
+
+  bullet.x = tracedPath.x;
+  bullet.y = tracedPath.y;
+  bullet.trailLength = Math.max(32, Math.hypot(bullet.x - previousX, bullet.y - previousY));
+  bullet.laserResolved = true;
+
+  return {
+    previousX,
+    previousY,
+    hitObstacle: tracedPath.hitObstacle
+  };
 }
 
 function getActivePlayerWeapon(player: Fighter) {
@@ -1802,6 +1888,12 @@ function shoot(
     const rageSpeedFactor = fighter.rageTimer > 0 ? 2 : 1;
     const playerSpeedFactor = 1.5;
     const attackSpeedFactor = Math.pow(PLAYER_ATTACK_SPEED_MULTIPLIER, attackSpeedUpgradeLevel);
+    const isFourthShotPierce =
+      fourthShotPierceUnlocked &&
+      weapon !== "laser" &&
+      weapon !== "bazooka" &&
+      (fourthShotPierceCounter + 1) % 4 === 0;
+    fourthShotPierceCounter += 1;
 
     if (weapon === "pistol") {
       fighter.reload = (0.2 * rageReloadFactor) / attackSpeedFactor;
@@ -1846,16 +1938,36 @@ function shoot(
           0
         )
       );
-    } else if (weapon === "rifle") {
-      fighter.reload = (0.08 * rageReloadFactor) / attackSpeedFactor;
+    } else if (weapon === "laser") {
+      fighter.reload = (0.12 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
-        createBulletInArray(bulletTarget, fighter, fighter.dir, 240 * playerSpeedFactor * rageSpeedFactor, 10, 34, 3, weapon, shotId, sourceInputSeq, 0)
+        createBulletInArray(
+          bulletTarget,
+          fighter,
+          fighter.dir,
+          60000 * rageSpeedFactor,
+          0.035,
+          34,
+          4,
+          weapon,
+          shotId,
+          sourceInputSeq,
+          0
+        )
       );
     } else {
       fighter.reload = (0.275 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
         createBulletInArray(bulletTarget, fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon, shotId, sourceInputSeq, 0)
       );
+    }
+
+    if (isFourthShotPierce) {
+      for (const bullet of createdBullets) {
+        bullet.canPierce = true;
+        bullet.color = "#a6f8ff";
+        bullet.piercedTargetIds = "";
+      }
     }
   } else {
     fighter.reload = 0.34;
@@ -1989,8 +2101,12 @@ function advancePredictedPlayerTimers(player: Fighter, dt: number) {
 
 function updateVisualOnlyBullets(target: Bullet[], dt: number) {
   for (const bullet of target) {
-    bullet.x += bullet.vx * dt;
-    bullet.y += bullet.vy * dt;
+    if (bullet.weapon === "laser") {
+      resolveLaserBeam(bullet, dt);
+    } else {
+      bullet.x += bullet.vx * dt;
+      bullet.y += bullet.vy * dt;
+    }
     bullet.life -= dt;
     if (
       bullet.x < 0 ||
@@ -2292,18 +2408,18 @@ function getBoss1ShieldSpin() {
   return elapsed * BOSS1_SHIELD_SPIN_SPEED;
 }
 
-function bulletHitsBoss1Shield(bullet: Bullet, boss: Fighter) {
+function projectileHitsBoss1Shield(x: number, y: number, size: number, boss: Fighter) {
   if (boss.bossKind !== "iron" || !bossShieldActive()) {
     return false;
   }
 
-  const dx = bullet.x - boss.x;
-  const dy = bullet.y - boss.y;
+  const dx = x - boss.x;
+  const dy = y - boss.y;
   const distanceFromBoss = Math.hypot(dx, dy);
   const shieldRadius = getBoss1ShieldRadius(boss);
   const shieldHalfThickness = BOSS1_SHIELD_LINE_WIDTH * 0.5 + 0.5;
 
-  if (Math.abs(distanceFromBoss - shieldRadius) > shieldHalfThickness + bullet.size) {
+  if (Math.abs(distanceFromBoss - shieldRadius) > shieldHalfThickness + size) {
     return false;
   }
 
@@ -2311,6 +2427,26 @@ function bulletHitsBoss1Shield(bullet: Bullet, boss: Fighter) {
   const shieldCenterAngle = getBoss1ShieldSpin() + shieldArcLength * 0.5;
   const bulletAngle = Math.atan2(dy, dx);
   return angleDifference(bulletAngle, shieldCenterAngle) <= shieldArcLength * 0.5;
+}
+
+function bulletHitsBoss1Shield(bullet: Bullet, boss: Fighter) {
+  return projectileHitsBoss1Shield(bullet.x, bullet.y, bullet.size, boss);
+}
+
+function findShieldCollisionOnPath(startX: number, startY: number, endX: number, endY: number, bullet: Bullet, boss: Fighter) {
+  const distance = Math.hypot(endX - startX, endY - startY);
+  const steps = Math.max(1, Math.ceil(distance / 2));
+
+  for (let step = 1; step <= steps; step += 1) {
+    const t = step / steps;
+    const x = startX + (endX - startX) * t;
+    const y = startY + (endY - startY) * t;
+    if (projectileHitsBoss1Shield(x, y, bullet.size, boss)) {
+      return { x, y };
+    }
+  }
+
+  return null;
 }
 
 function queueBossAttack(boss: Fighter, player: Fighter | null) {
@@ -2603,22 +2739,31 @@ function reflectBulletOffBoss(bullet: Bullet, boss: Fighter, originalOwner: Figh
   bullet.vy = Math.sin(angle) * speed;
   bullet.x = boss.x + Math.cos(angle) * (boss.radius + 6);
   bullet.y = boss.y + Math.sin(angle) * (boss.radius + 6);
-  bullet.life = Math.max(1, bullet.life);
+  bullet.life = bullet.weapon === "laser" ? 0.035 : Math.max(1, bullet.life);
   bullet.color = "#d8e5f0";
   bullet.isCrit = false;
   bullet.healAmount = 0;
+  bullet.trailLength = 0;
+  bullet.piercedTargetIds = "";
+  bullet.laserResolved = false;
   playHitSound(false);
 }
 
 function moveFighter(fighter: Fighter, dt: number) {
-  const nextX = fighter.x + fighter.vx * dt;
-  const nextY = fighter.y + fighter.vy * dt;
+  const totalVx = fighter.vx + fighter.knockbackVx;
+  const totalVy = fighter.vy + fighter.knockbackVy;
+  const nextX = fighter.x + totalVx * dt;
+  const nextY = fighter.y + totalVy * dt;
 
   if (canMoveTo(nextX, fighter.y, fighter.radius)) {
     fighter.x = nextX;
+  } else {
+    fighter.knockbackVx = 0;
   }
   if (canMoveTo(fighter.x, nextY, fighter.radius)) {
     fighter.y = nextY;
+  } else {
+    fighter.knockbackVy = 0;
   }
 }
 
@@ -2630,17 +2775,8 @@ function applyKnockback(target: Fighter, sourceX: number, sourceY: number, stren
   const dx = target.x - sourceX;
   const dy = target.y - sourceY;
   const length = Math.hypot(dx, dy) || 1;
-  const knockX = (dx / length) * strength;
-  const knockY = (dy / length) * strength;
-  const nextX = target.x + knockX;
-  const nextY = target.y + knockY;
-
-  if (canMoveTo(nextX, target.y, target.radius)) {
-    target.x = nextX;
-  }
-  if (canMoveTo(target.x, nextY, target.radius)) {
-    target.y = nextY;
-  }
+  target.knockbackVx += (dx / length) * strength * KNOCKBACK_VELOCITY_SCALE;
+  target.knockbackVy += (dy / length) * strength * KNOCKBACK_VELOCITY_SCALE;
 }
 
 function despawnEnemies() {
@@ -2677,6 +2813,8 @@ function clearRunStateOnPlayerDeath() {
   swordUpgradeLevel = 0;
   regenUpgradeLevel = 0;
   attackSpeedUpgradeLevel = 0;
+  fourthShotPierceUnlocked = false;
+  fourthShotPierceCounter = 0;
   swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = 1;
   shopDenySoundCooldown = 0;
@@ -2719,6 +2857,8 @@ function beginFullRunReset() {
     fighter.hp = 0;
     fighter.vx = 0;
     fighter.vy = 0;
+    fighter.knockbackVx = 0;
+    fighter.knockbackVy = 0;
     fighter.reload = 0;
     fighter.attackCooldown = 0;
     fighter.shieldTimer = 0;
@@ -2737,6 +2877,8 @@ function downPlayer(target: Fighter) {
   target.hp = 0;
   target.vx = 0;
   target.vy = 0;
+  target.knockbackVx = 0;
+  target.knockbackVy = 0;
   target.reload = 0;
   target.attackCooldown = 0;
   target.shieldTimer = 0;
@@ -2767,29 +2909,45 @@ function revivePlayer(target: Fighter) {
 
 function spawnShopItems() {
   shopItems.length = 0;
-  const laneY = WORLD_HEIGHT / 2;
+  const topRowY = WORLD_HEIGHT / 2 - 18;
+  const bottomRowY = WORLD_HEIGHT / 2 + 18;
   const candidates: Array<ShopItem> = [
     {
-      x: WORLD_WIDTH * 0.2,
-      y: laneY,
+      x: WORLD_WIDTH * 0.18,
+      y: topRowY,
       itemType: "swords",
       cost: SHOP_ITEM_COST_SWORDS
     },
     {
       x: WORLD_WIDTH * 0.5,
-      y: laneY,
+      y: topRowY,
       itemType: "regen",
       cost: SHOP_ITEM_COST_REGEN
     },
     {
-      x: WORLD_WIDTH * 0.8,
-      y: laneY,
+      x: WORLD_WIDTH * 0.82,
+      y: topRowY,
       itemType: "attackSpeed",
       cost: SHOP_ITEM_COST_ATTACK_SPEED
+    },
+    {
+      x: WORLD_WIDTH * 0.32,
+      y: bottomRowY,
+      itemType: "shockwave",
+      cost: SHOP_ITEM_COST_SHOCKWAVE
+    },
+    {
+      x: WORLD_WIDTH * 0.68,
+      y: bottomRowY,
+      itemType: "pierce",
+      cost: SHOP_ITEM_COST_PIERCE
     }
   ];
 
   for (const item of candidates) {
+    if (item.itemType === "pierce" && fourthShotPierceUnlocked) {
+      continue;
+    }
     shopItems.push({
       ...item,
       x: clamp(item.x, 18, WORLD_WIDTH - 18),
@@ -2972,8 +3130,19 @@ function explodeBazooka(bullet: Bullet) {
 
 function updateBullets(dt: number) {
   for (const bullet of bullets) {
-    bullet.x += bullet.vx * dt;
-    bullet.y += bullet.vy * dt;
+    let previousX = bullet.x;
+    let previousY = bullet.y;
+    let hitObstacle = false;
+
+    if (bullet.weapon === "laser") {
+      const laserStep = resolveLaserBeam(bullet, dt);
+      previousX = laserStep.previousX;
+      previousY = laserStep.previousY;
+      hitObstacle = laserStep.hitObstacle;
+    } else {
+      bullet.x += bullet.vx * dt;
+      bullet.y += bullet.vy * dt;
+    }
     bullet.life -= dt;
 
     if (bullet.healAmount > 0) {
@@ -3000,12 +3169,20 @@ function updateBullets(dt: number) {
 
     const boss = getBoss();
     const owner = fighters.find((candidate) => candidate.id === bullet.ownerId) ?? null;
+    const shieldCollision = boss && owner && owner.team !== "enemy"
+      ? bullet.weapon === "laser"
+        ? findShieldCollisionOnPath(previousX, previousY, bullet.x, bullet.y, bullet, boss)
+        : bulletHitsBoss1Shield(bullet, boss)
+          ? { x: bullet.x, y: bullet.y }
+          : null
+      : null;
     if (
       boss &&
       owner &&
-      owner.team !== "enemy" &&
-      bulletHitsBoss1Shield(bullet, boss)
+      shieldCollision
     ) {
+      bullet.x = shieldCollision.x;
+      bullet.y = shieldCollision.y;
       reflectBulletOffBoss(bullet, boss, owner);
       continue;
     }
@@ -3034,6 +3211,7 @@ function updateBullets(dt: number) {
     }
 
     if (
+      (bullet.weapon !== "laser" && hitObstacle) ||
       bullet.x < 0 ||
       bullet.x > WORLD_WIDTH ||
       bullet.y < 0 ||
@@ -3047,9 +3225,50 @@ function updateBullets(dt: number) {
       continue;
     }
 
+    if (bullet.weapon === "laser") {
+      const piercedTargets = fighters
+        .filter((fighter) => {
+          if (fighter.id === bullet.ownerId || !isFighterActive(fighter) || hasPiercedTarget(bullet, fighter.id)) {
+            return false;
+          }
+          if (!canHitTarget(owner ?? null, fighter)) {
+            return false;
+          }
+          return distanceToSegment(fighter.x, fighter.y, previousX, previousY, bullet.x, bullet.y) < fighter.radius + bullet.size;
+        })
+        .sort(
+          (a, b) =>
+            Math.hypot(a.x - previousX, a.y - previousY) - Math.hypot(b.x - previousX, b.y - previousY)
+        );
+
+      let laserConnected = false;
+      for (const target of piercedTargets) {
+        markPiercedTarget(bullet, target.id);
+        const directHitKnockback = target.rageTimer > 0 && target.isPlayer ? 0 : bullet.isCrit ? 8 : 0;
+        applyProjectileDamage(target, bullet.damage, bullet.x, bullet.y, directHitKnockback, owner);
+        laserConnected = true;
+
+        if (target.rageTimer > 0 && target.isPlayer) {
+          if (owner && owner.team === "enemy" && isFighterActive(owner)) {
+            owner.hp -= bullet.damage;
+            owner.flash = 0.18;
+            applyKnockback(owner, target.x, target.y, 18);
+            if (owner.hp <= 0) {
+              defeatFighter(owner, target);
+            }
+          }
+        }
+      }
+
+      if (laserConnected) {
+        playHitSound(false);
+      }
+      continue;
+    }
+
     const target = fighters
       .filter((fighter) => {
-        if (fighter.id === bullet.ownerId || !isFighterActive(fighter)) {
+        if (fighter.id === bullet.ownerId || !isFighterActive(fighter) || hasPiercedTarget(bullet, fighter.id)) {
           return false;
         }
         if (!canHitTarget(owner ?? null, fighter)) {
@@ -3074,10 +3293,12 @@ function updateBullets(dt: number) {
 
     const directHitKnockback = target.rageTimer > 0 && target.isPlayer ? 0 : bullet.isCrit ? 8 : 0;
     applyProjectileDamage(target, bullet.damage, bullet.x, bullet.y, directHitKnockback, owner);
-    bullet.life = 0;
     playHitSound(false);
 
     if (target.rageTimer > 0 && target.isPlayer) {
+      if (bullet.canPierce) {
+        markPiercedTarget(bullet, target.id);
+      }
       if (owner && owner.team === "enemy" && isFighterActive(owner)) {
         owner.hp -= bullet.damage;
         owner.flash = 0.18;
@@ -3086,8 +3307,18 @@ function updateBullets(dt: number) {
           defeatFighter(owner, target);
         }
       }
+      if (!bullet.canPierce) {
+        bullet.life = 0;
+      }
       continue;
     }
+
+    if (bullet.canPierce) {
+      markPiercedTarget(bullet, target.id);
+      continue;
+    }
+
+    bullet.life = 0;
 
     if (target.hp <= 0) {
       continue;
@@ -3150,6 +3381,25 @@ function spawnBossBlueStars(centerX: number, centerY: number) {
   }
 }
 
+function triggerPlayerShockwave(player: Fighter) {
+  const shockwaveRadius = 38;
+  const knockbackStrength = 11;
+  addExplosion(player.x, player.y, shockwaveRadius);
+
+  for (const enemy of fighters) {
+    if (enemy.team !== "enemy" || !isFighterActive(enemy)) {
+      continue;
+    }
+    if (Math.hypot(enemy.x - player.x, enemy.y - player.y) > shockwaveRadius + enemy.radius) {
+      continue;
+    }
+    enemy.flash = Math.max(enemy.flash, 0.12);
+    applyKnockback(enemy, player.x, player.y, knockbackStrength);
+  }
+
+  playMeteorSound();
+}
+
 function tryBuyShopItemByTouch(player: Fighter, item: ShopItem) {
   if (item.itemType === "swords") {
     if (player.score < item.cost) {
@@ -3169,6 +3419,27 @@ function tryBuyShopItemByTouch(player: Fighter, item: ShopItem) {
     regenUpgradeLevel += 1;
     regenTickTimer = 1;
     player.score -= item.cost;
+    playShopBuySound();
+    return true;
+  }
+
+  if (item.itemType === "pierce") {
+    if (player.score < item.cost || fourthShotPierceUnlocked) {
+      return false;
+    }
+    fourthShotPierceUnlocked = true;
+    fourthShotPierceCounter = 0;
+    player.score -= item.cost;
+    playShopBuySound();
+    return true;
+  }
+
+  if (item.itemType === "shockwave") {
+    if (player.score < item.cost) {
+      return false;
+    }
+    player.score -= item.cost;
+    triggerPlayerShockwave(player);
     playShopBuySound();
     return true;
   }
@@ -3628,6 +3899,14 @@ function update(dt: number) {
     fighter.flash = Math.max(0, fighter.flash - dt);
     fighter.attackCooldown = Math.max(0, fighter.attackCooldown - dt);
     fighter.shieldTimer = Math.max(0, fighter.shieldTimer - dt);
+    fighter.knockbackVx *= Math.max(0, 1 - dt * KNOCKBACK_DECAY);
+    fighter.knockbackVy *= Math.max(0, 1 - dt * KNOCKBACK_DECAY);
+    if (Math.abs(fighter.knockbackVx) < 1) {
+      fighter.knockbackVx = 0;
+    }
+    if (Math.abs(fighter.knockbackVy) < 1) {
+      fighter.knockbackVy = 0;
+    }
     fighter.rageTimer = Math.max(0, fighter.rageTimer - dt);
     if (fighter.rageTimer <= 0) {
       fighter.rageCooldown = Math.max(0, fighter.rageCooldown - dt);
@@ -4215,7 +4494,15 @@ function drawShop() {
   }
 
   for (const item of shopItems) {
-    const label = item.itemType === "swords" ? "SWORD" : item.itemType === "regen" ? "REGEN" : "ATK";
+    const label = item.itemType === "swords"
+      ? "SWORD"
+      : item.itemType === "regen"
+        ? "REGEN"
+        : item.itemType === "attackSpeed"
+          ? "ATK"
+          : item.itemType === "shockwave"
+            ? "WAVE"
+            : "PIER4";
     ctx.fillStyle = "rgba(18, 24, 38, 0.92)";
     ctx.fillRect(item.x - 12, item.y - 8, 24, 16);
     ctx.strokeStyle = "#f7d88a";
@@ -4300,37 +4587,72 @@ function drawBullets() {
       .filter((sourceInputSeq): sourceInputSeq is number => sourceInputSeq !== null)
   );
 
+  function drawBullet(bullet: Bullet) {
+    const color = bullet.isCrit ? "#fff17a" : bullet.color;
+    if (bullet.weapon === "laser") {
+      const speed = Math.hypot(bullet.vx, bullet.vy) || 1;
+      const dirX = bullet.vx / speed;
+      const dirY = bullet.vy / speed;
+      const trailLength = bullet.trailLength ?? 160;
+      const tailX = bullet.x - dirX * trailLength;
+      const tailY = bullet.y - dirY * trailLength;
+
+      ctx.strokeStyle = "rgba(102, 246, 255, 0.16)";
+      ctx.lineWidth = bullet.size * 3.6;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(tailX, tailY);
+      ctx.lineTo(bullet.x, bullet.y);
+      ctx.stroke();
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = bullet.size * 1.45;
+      ctx.beginPath();
+      ctx.moveTo(tailX, tailY);
+      ctx.lineTo(bullet.x, bullet.y);
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
+      ctx.lineWidth = Math.max(1.5, bullet.size * 0.42);
+      ctx.beginPath();
+      ctx.moveTo(tailX, tailY);
+      ctx.lineTo(bullet.x, bullet.y);
+      ctx.stroke();
+
+      ctx.fillStyle = "rgba(102, 246, 255, 0.28)";
+      ctx.beginPath();
+      ctx.arc(bullet.x, bullet.y, bullet.size * 1.05, 0, TAU);
+      ctx.fill();
+
+      ctx.fillStyle = "#d6ffff";
+      ctx.beginPath();
+      ctx.arc(bullet.x, bullet.y, bullet.size * 0.5, 0, TAU);
+      ctx.fill();
+      return;
+    }
+
+    ctx.fillStyle = color;
+    ctx.fillRect(
+      bullet.x - bullet.size / 2,
+      bullet.y - bullet.size / 2,
+      bullet.size,
+      bullet.size
+    );
+  }
+
   for (const bullet of bullets) {
     if (bullet.sourceInputSeq !== null && unresolvedLocalShotSeqs.has(bullet.sourceInputSeq)) {
       continue;
     }
-    ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
-    ctx.fillRect(
-      bullet.x - bullet.size / 2,
-      bullet.y - bullet.size / 2,
-      bullet.size,
-      bullet.size
-    );
+    drawBullet(bullet);
   }
 
   for (const bullet of guestAuthoritativeShotBullets) {
-    ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
-    ctx.fillRect(
-      bullet.x - bullet.size / 2,
-      bullet.y - bullet.size / 2,
-      bullet.size,
-      bullet.size
-    );
+    drawBullet(bullet);
   }
 
   for (const bullet of guestPredictedBullets) {
-    ctx.fillStyle = bullet.isCrit ? "#fff17a" : bullet.color;
-    ctx.fillRect(
-      bullet.x - bullet.size / 2,
-      bullet.y - bullet.size / 2,
-      bullet.size,
-      bullet.size
-    );
+    drawBullet(bullet);
   }
 }
 
@@ -4462,6 +4784,10 @@ function drawHud() {
   if (attackSpeedUpgradeLevel > 0) {
     hudLines.push(`Attack Speed x${attackSpeedFactor.toFixed(2)}`);
   }
+  if (fourthShotPierceUnlocked) {
+    const shotsUntilPierce = 4 - (fourthShotPierceCounter % 4);
+    hudLines.push(`4th Shot Pierce IN ${shotsUntilPierce}`);
+  }
 
   ctx.font = 'bold 8px "Courier New", monospace';
   const longestLineWidth = hudLines.reduce((maxWidth, line) => Math.max(maxWidth, ctx.measureText(line).width), 0);
@@ -4543,7 +4869,7 @@ function drawHud() {
     ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
 
     ctx.fillStyle = selected ? "#3e2410" : unlocked ? "#f5e7c8" : "rgba(245, 231, 200, 0.4)";
-    const threshold = weapon === "pistol" ? 0 : weapon === "smg" ? 5 : weapon === "shotgun" ? 10 : weapon === "rifle" ? 15 : 20;
+    const threshold = weapon === "pistol" ? 0 : weapon === "smg" ? 5 : weapon === "shotgun" ? 10 : weapon === "laser" ? 15 : 20;
     ctx.fillText(`${index + 1}.${weapon.toUpperCase()} ${threshold}`, x + 5, rect.y + 9);
   });
 
@@ -6026,6 +6352,8 @@ function createRuntimeSnapshot(): RuntimeSnapshot {
     swordUpgradeLevel,
     regenUpgradeLevel,
     attackSpeedUpgradeLevel,
+    fourthShotPierceUnlocked,
+    fourthShotPierceCounter,
     swordSpawnTimer,
     regenTickTimer,
     orbitingSwords: structuredClone(orbitingSwords),
@@ -6123,7 +6451,9 @@ function syncNetworkFighterArray(target: Fighter[], source: Fighter[]) {
       ...fighter,
       controller: getNetworkFighterController(fighter),
       downed: fighter.downed ?? false,
-      reviveProgress: fighter.reviveProgress ?? 0
+      reviveProgress: fighter.reviveProgress ?? 0,
+      knockbackVx: fighter.knockbackVx ?? 0,
+      knockbackVy: fighter.knockbackVy ?? 0
     };
     if (index < target.length) {
       Object.assign(target[index], normalizedFighter);
@@ -6140,7 +6470,9 @@ function blendFighter(fromFighter: Fighter | undefined, toFighter: Fighter, alph
       ...toFighter,
       controller: getNetworkFighterController(toFighter),
       downed: toFighter.downed ?? false,
-      reviveProgress: toFighter.reviveProgress ?? 0
+      reviveProgress: toFighter.reviveProgress ?? 0,
+      knockbackVx: toFighter.knockbackVx ?? 0,
+      knockbackVy: toFighter.knockbackVy ?? 0
     };
   }
 
@@ -6156,6 +6488,8 @@ function blendFighter(fromFighter: Fighter | undefined, toFighter: Fighter, alph
     rageCharge: blendNumber(fromFighter.rageCharge, toFighter.rageCharge, alpha),
     rageTimer: blendNumber(fromFighter.rageTimer, toFighter.rageTimer, alpha),
     rageCooldown: blendNumber(fromFighter.rageCooldown, toFighter.rageCooldown, alpha),
+    knockbackVx: blendNumber(fromFighter.knockbackVx ?? 0, toFighter.knockbackVx ?? 0, alpha),
+    knockbackVy: blendNumber(fromFighter.knockbackVy ?? 0, toFighter.knockbackVy ?? 0, alpha),
     controller: getNetworkFighterController(toFighter),
     downed: toFighter.downed ?? false,
     reviveProgress: blendNumber(fromFighter.reviveProgress ?? 0, toFighter.reviveProgress ?? 0, alpha)
@@ -6257,6 +6591,8 @@ function createNetworkSnapshot(): NetworkSnapshot {
     swordUpgradeLevel,
     regenUpgradeLevel,
     attackSpeedUpgradeLevel,
+    fourthShotPierceUnlocked,
+    fourthShotPierceCounter,
     elapsed,
     survivalWithoutDeath,
     bossFightStarted,
@@ -6293,6 +6629,8 @@ function applyRuntimeSnapshot(snapshot: RuntimeSnapshot) {
             : fighter.controller ?? "local",
       downed: fighter.downed ?? false,
       reviveProgress: fighter.reviveProgress ?? 0,
+      knockbackVx: fighter.knockbackVx ?? 0,
+      knockbackVy: fighter.knockbackVy ?? 0,
       selectedWeapon: fighter.selectedWeapon ?? (fighter.playerSlot === 0 ? snapshot.selectedWeapon : "pistol"),
       highestUnlockedWeapon: fighter.highestUnlockedWeapon ?? (fighter.playerSlot === 0 ? snapshot.highestUnlockedWeapon : "pistol")
     }))
@@ -6319,6 +6657,8 @@ function applyRuntimeSnapshot(snapshot: RuntimeSnapshot) {
   swordUpgradeLevel = snapshot.swordUpgradeLevel ?? (snapshot.hasSwordUpgrade ? 1 : 0);
   regenUpgradeLevel = snapshot.regenUpgradeLevel ?? (snapshot.hasRegenUpgrade ? 1 : 0);
   attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel ?? (snapshot.hasAttackSpeedUpgrade ? 1 : 0);
+  fourthShotPierceUnlocked = snapshot.fourthShotPierceUnlocked ?? false;
+  fourthShotPierceCounter = snapshot.fourthShotPierceCounter ?? 0;
   swordSpawnTimer = snapshot.swordSpawnTimer ?? ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = snapshot.regenTickTimer ?? 1;
   orbitingSwords.length = 0;
@@ -6373,6 +6713,8 @@ function applyNetworkSnapshot(snapshot: NetworkSnapshot) {
   swordUpgradeLevel = snapshot.swordUpgradeLevel;
   regenUpgradeLevel = snapshot.regenUpgradeLevel;
   attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel;
+  fourthShotPierceUnlocked = snapshot.fourthShotPierceUnlocked;
+  fourthShotPierceCounter = snapshot.fourthShotPierceCounter;
   elapsed = snapshot.elapsed;
   survivalWithoutDeath = snapshot.survivalWithoutDeath;
   bossFightStarted = snapshot.bossFightStarted;
@@ -6424,6 +6766,8 @@ function applyInterpolatedNetworkSnapshot(fromSnapshot: NetworkSnapshot, toSnaps
   swordUpgradeLevel = toSnapshot.swordUpgradeLevel;
   regenUpgradeLevel = toSnapshot.regenUpgradeLevel;
   attackSpeedUpgradeLevel = toSnapshot.attackSpeedUpgradeLevel;
+  fourthShotPierceUnlocked = toSnapshot.fourthShotPierceUnlocked;
+  fourthShotPierceCounter = toSnapshot.fourthShotPierceCounter;
   elapsed = blendNumber(fromSnapshot.elapsed, toSnapshot.elapsed, alpha);
   survivalWithoutDeath = blendNumber(fromSnapshot.survivalWithoutDeath, toSnapshot.survivalWithoutDeath, alpha);
   bossFightStarted = toSnapshot.bossFightStarted;

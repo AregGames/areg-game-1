@@ -40,9 +40,9 @@ Open `http://localhost:5173`.
 Your score unlocks stronger weapons:
 
 - `0` kills: Pistol
-- `5` kills: Shotgun
-- `10` kills: SMG
-- `15` kills: Rifle
+- `5` kills: SMG
+- `10` kills: Shotgun
+- `15` kills: Laser Gun
 - `20` kills: Bazooka
 
 Rules:
@@ -50,6 +50,7 @@ Rules:
 - You can manually switch between unlocked weapons with keys `1` to `5`.
 - Player shots have a base `2%` crit chance.
 - Critical hits deal `2x` damage and apply a small knockback.
+- Laser shots pierce through enemies until they hit a wall or expire.
 - Bazooka shots explode near targets and deal blast-radius damage.
 
 ## Pickups
