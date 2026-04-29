@@ -31,6 +31,7 @@ const SHOP_ITEM_COST_REGEN = 20;
 const SHOP_ITEM_COST_ATTACK_SPEED = 30;
 const SHOP_ITEM_COST_PIERCE = 15;
 const SHOP_ITEM_COST_SHOCKWAVE = 20;
+const SHOCKWAVE_INTERVAL = 3;
 const PLAYER_ATTACK_SPEED_MULTIPLIER = 1.25;
 const ORBITAL_SWORD_SPAWN_INTERVAL = 10;
 const ORBITAL_SWORD_DURATION = 3.5;
@@ -300,6 +301,8 @@ type RuntimeSnapshot = {
   attackSpeedUpgradeLevel: number;
   fourthShotPierceUnlocked?: boolean;
   fourthShotPierceCounter?: number;
+  shockwaveUnlocked?: boolean;
+  shockwaveTimer?: number;
   hasSwordUpgrade?: boolean;
   hasRegenUpgrade?: boolean;
   hasAttackSpeedUpgrade?: boolean;
@@ -358,6 +361,8 @@ type NetworkSnapshot = {
   attackSpeedUpgradeLevel: number;
   fourthShotPierceUnlocked: boolean;
   fourthShotPierceCounter: number;
+  shockwaveUnlocked: boolean;
+  shockwaveTimer: number;
   elapsed: number;
   survivalWithoutDeath: number;
   bossFightStarted: boolean;
@@ -472,6 +477,8 @@ let regenUpgradeLevel = 0;
 let attackSpeedUpgradeLevel = 0;
 let fourthShotPierceUnlocked = false;
 let fourthShotPierceCounter = 0;
+let shockwaveUnlocked = false;
+let shockwaveTimer = SHOCKWAVE_INTERVAL;
 let swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
 let regenTickTimer = 1;
 const orbitingSwords: OrbitingSword[] = [];
@@ -1006,6 +1013,8 @@ function spawnRoster() {
   attackSpeedUpgradeLevel = 0;
   fourthShotPierceUnlocked = false;
   fourthShotPierceCounter = 0;
+  shockwaveUnlocked = false;
+  shockwaveTimer = SHOCKWAVE_INTERVAL;
   swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = 1;
   shopDenySoundCooldown = 0;
@@ -2404,8 +2413,20 @@ function getBoss1ShieldArcLength() {
   return TAU * BOSS1_SHIELD_ARC_PORTION;
 }
 
-function getBoss1ShieldSpin() {
-  return elapsed * BOSS1_SHIELD_SPIN_SPEED;
+function getIronBossSwordAngle(boss: Fighter) {
+  return bossIntroTimer > 0
+    ? boss.dir
+    : bossAttackType === "left"
+      ? Math.PI
+      : bossAttackType === "right"
+        ? 0
+        : bossAttackAngle || boss.dir;
+}
+
+function getBoss1ShieldStartAngle(boss: Fighter) {
+  const shieldArcLength = getBoss1ShieldArcLength();
+  const shieldCenterAngle = getIronBossSwordAngle(boss) + Math.PI;
+  return shieldCenterAngle - shieldArcLength * 0.5;
 }
 
 function projectileHitsBoss1Shield(x: number, y: number, size: number, boss: Fighter) {
@@ -2424,7 +2445,7 @@ function projectileHitsBoss1Shield(x: number, y: number, size: number, boss: Fig
   }
 
   const shieldArcLength = getBoss1ShieldArcLength();
-  const shieldCenterAngle = getBoss1ShieldSpin() + shieldArcLength * 0.5;
+  const shieldCenterAngle = getBoss1ShieldStartAngle(boss) + shieldArcLength * 0.5;
   const bulletAngle = Math.atan2(dy, dx);
   return angleDifference(bulletAngle, shieldCenterAngle) <= shieldArcLength * 0.5;
 }
@@ -2815,6 +2836,8 @@ function clearRunStateOnPlayerDeath() {
   attackSpeedUpgradeLevel = 0;
   fourthShotPierceUnlocked = false;
   fourthShotPierceCounter = 0;
+  shockwaveUnlocked = false;
+  shockwaveTimer = SHOCKWAVE_INTERVAL;
   swordSpawnTimer = ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = 1;
   shopDenySoundCooldown = 0;
@@ -2946,6 +2969,9 @@ function spawnShopItems() {
 
   for (const item of candidates) {
     if (item.itemType === "pierce" && fourthShotPierceUnlocked) {
+      continue;
+    }
+    if (item.itemType === "shockwave" && shockwaveUnlocked) {
       continue;
     }
     shopItems.push({
@@ -3391,7 +3417,7 @@ function spawnBossBlueStars(centerX: number, centerY: number) {
 
 function triggerPlayerShockwave(player: Fighter) {
   const shockwaveRadius = 38;
-  const knockbackStrength = 11;
+  const knockbackStrength = 15;
   addExplosion(player.x, player.y, shockwaveRadius);
 
   for (const enemy of fighters) {
@@ -3443,11 +3469,12 @@ function tryBuyShopItemByTouch(player: Fighter, item: ShopItem) {
   }
 
   if (item.itemType === "shockwave") {
-    if (player.score < item.cost) {
+    if (player.score < item.cost || shockwaveUnlocked) {
       return false;
     }
+    shockwaveUnlocked = true;
+    shockwaveTimer = 0;
     player.score -= item.cost;
-    triggerPlayerShockwave(player);
     playShopBuySound();
     return true;
   }
@@ -3546,6 +3573,14 @@ function updateShopUpgrades(dt: number) {
       const regenTicks = Math.floor(Math.abs(regenTickTimer) + 1);
       player.hp = Math.min(player.maxHp, player.hp + REGEN_AMOUNT_PER_SECOND * regenUpgradeLevel * regenTicks);
       regenTickTimer += regenTicks;
+    }
+  }
+
+  if (shockwaveUnlocked && isFighterActive(player)) {
+    shockwaveTimer -= dt;
+    while (shockwaveTimer <= 0) {
+      triggerPlayerShockwave(player);
+      shockwaveTimer += SHOCKWAVE_INTERVAL;
     }
   }
 
@@ -4136,14 +4171,7 @@ function drawFighter(fighter: Fighter) {
       return;
     }
 
-    const swordAngle =
-      bossIntroTimer > 0
-        ? fighter.dir
-        : bossAttackType === "left"
-          ? Math.PI
-          : bossAttackType === "right"
-            ? 0
-            : bossAttackAngle || fighter.dir;
+    const swordAngle = getIronBossSwordAngle(fighter);
     const swordReach = fighter.isBoss ? getBossArenaRadius() - 4 : 24;
     const swordX = fighter.x + Math.cos(swordAngle) * swordReach;
     const swordY = fighter.y + Math.sin(swordAngle) * swordReach;
@@ -4155,13 +4183,13 @@ function drawFighter(fighter: Fighter) {
 
     if (bossShieldActive()) {
       const shieldRadius = getBoss1ShieldRadius(fighter);
-      const shieldSpin = getBoss1ShieldSpin();
+      const shieldStartAngle = getBoss1ShieldStartAngle(fighter);
       const shieldArcLength = getBoss1ShieldArcLength();
       const shieldAlpha = 0.65 + Math.sin(elapsed * 10) * 0.18;
       ctx.strokeStyle = `rgba(180, 215, 255, ${shieldAlpha})`;
       ctx.lineWidth = BOSS1_SHIELD_LINE_WIDTH;
       ctx.beginPath();
-      ctx.arc(fighter.x, fighter.y, shieldRadius, shieldSpin, shieldSpin + shieldArcLength);
+      ctx.arc(fighter.x, fighter.y, shieldRadius, shieldStartAngle, shieldStartAngle + shieldArcLength);
       ctx.stroke();
     }
 
@@ -4795,6 +4823,9 @@ function drawHud() {
   if (fourthShotPierceUnlocked) {
     const shotsUntilPierce = 4 - (fourthShotPierceCounter % 4);
     hudLines.push(`4th Shot Pierce IN ${shotsUntilPierce}`);
+  }
+  if (shockwaveUnlocked) {
+    hudLines.push(`Shockwave ${Math.max(0, shockwaveTimer).toFixed(1)}s`);
   }
 
   ctx.font = 'bold 8px "Courier New", monospace';
@@ -6362,6 +6393,8 @@ function createRuntimeSnapshot(): RuntimeSnapshot {
     attackSpeedUpgradeLevel,
     fourthShotPierceUnlocked,
     fourthShotPierceCounter,
+    shockwaveUnlocked,
+    shockwaveTimer,
     swordSpawnTimer,
     regenTickTimer,
     orbitingSwords: structuredClone(orbitingSwords),
@@ -6601,6 +6634,8 @@ function createNetworkSnapshot(): NetworkSnapshot {
     attackSpeedUpgradeLevel,
     fourthShotPierceUnlocked,
     fourthShotPierceCounter,
+    shockwaveUnlocked,
+    shockwaveTimer,
     elapsed,
     survivalWithoutDeath,
     bossFightStarted,
@@ -6667,6 +6702,8 @@ function applyRuntimeSnapshot(snapshot: RuntimeSnapshot) {
   attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel ?? (snapshot.hasAttackSpeedUpgrade ? 1 : 0);
   fourthShotPierceUnlocked = snapshot.fourthShotPierceUnlocked ?? false;
   fourthShotPierceCounter = snapshot.fourthShotPierceCounter ?? 0;
+  shockwaveUnlocked = snapshot.shockwaveUnlocked ?? false;
+  shockwaveTimer = snapshot.shockwaveTimer ?? SHOCKWAVE_INTERVAL;
   swordSpawnTimer = snapshot.swordSpawnTimer ?? ORBITAL_SWORD_SPAWN_INTERVAL;
   regenTickTimer = snapshot.regenTickTimer ?? 1;
   orbitingSwords.length = 0;
@@ -6723,6 +6760,8 @@ function applyNetworkSnapshot(snapshot: NetworkSnapshot) {
   attackSpeedUpgradeLevel = snapshot.attackSpeedUpgradeLevel;
   fourthShotPierceUnlocked = snapshot.fourthShotPierceUnlocked;
   fourthShotPierceCounter = snapshot.fourthShotPierceCounter;
+  shockwaveUnlocked = snapshot.shockwaveUnlocked;
+  shockwaveTimer = snapshot.shockwaveTimer;
   elapsed = snapshot.elapsed;
   survivalWithoutDeath = snapshot.survivalWithoutDeath;
   bossFightStarted = snapshot.bossFightStarted;
@@ -6776,6 +6815,8 @@ function applyInterpolatedNetworkSnapshot(fromSnapshot: NetworkSnapshot, toSnaps
   attackSpeedUpgradeLevel = toSnapshot.attackSpeedUpgradeLevel;
   fourthShotPierceUnlocked = toSnapshot.fourthShotPierceUnlocked;
   fourthShotPierceCounter = toSnapshot.fourthShotPierceCounter;
+  shockwaveUnlocked = toSnapshot.shockwaveUnlocked;
+  shockwaveTimer = blendNumber(fromSnapshot.shockwaveTimer, toSnapshot.shockwaveTimer, alpha);
   elapsed = blendNumber(fromSnapshot.elapsed, toSnapshot.elapsed, alpha);
   survivalWithoutDeath = blendNumber(fromSnapshot.survivalWithoutDeath, toSnapshot.survivalWithoutDeath, alpha);
   bossFightStarted = toSnapshot.bossFightStarted;
