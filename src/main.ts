@@ -3073,6 +3073,10 @@ function canHitTarget(owner: Fighter | null, target: Fighter) {
   return target.team === "enemy";
 }
 
+function isCoopDamagePenaltyActive() {
+  return multiplayerRole !== "solo" && getHumanFighters().length > 1;
+}
+
 function applyProjectileDamage(
   target: Fighter,
   damage: number,
@@ -3081,10 +3085,14 @@ function applyProjectileDamage(
   knockback: number,
   owner: Fighter | null
 ) {
+  const coopScaledDamage =
+    owner?.isPlayer && isCoopDamagePenaltyActive()
+      ? damage * 0.5
+      : damage;
   const scaledDamage =
     target.isPlayer && owner?.team === "enemy" && !owner.isBoss
-      ? damage * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE
-      : damage;
+      ? coopScaledDamage * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE
+      : coopScaledDamage;
   const appliedDamage = playerHasInfiniteHealth(target)
     ? 0
     : target.rageTimer > 0
