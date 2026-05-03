@@ -126,12 +126,53 @@ canvas {
   cursor: pointer;
 }
 
+.menu-actions button:disabled,
+.menu-shop-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .menu-actions button.ghost {
   background: rgba(16, 10, 8, 0.8);
 }
 
 .menu-actions button:hover {
   background: rgba(68, 42, 28, 0.95);
+}
+
+.menu-shop-summary {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 230, 186, 0.24);
+  background: rgba(30, 20, 16, 0.72);
+  font-size: 13px;
+}
+
+.menu-shop-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.menu-shop-item {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  text-align: left;
+  border: 1px solid rgba(255, 230, 186, 0.24);
+  background: rgba(30, 20, 16, 0.86);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.menu-shop-item strong {
+  font-size: 14px;
+}
+
+.menu-shop-meta {
+  font-size: 12px;
+  color: rgba(247, 234, 209, 0.82);
 }
 
 .menu-qr-wrap {

@@ -26,6 +26,7 @@ const BOSS1_SWORD_CONTACT_INTERVAL = 0.18;
 const SKULL_BOSS_PROJECTILE_WINDUP = 0.05;
 const MAX_SIMULTANEOUS_ENEMIES = 15;
 const NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE = 0.5;
+const DEATH_SHOP_ITEM_COST = 25;
 const SHOP_ITEM_COST_SWORDS = 20;
 const SHOP_ITEM_COST_REGEN = 20;
 const SHOP_ITEM_COST_ATTACK_SPEED = 30;
@@ -51,6 +52,8 @@ const DEBUG_SHOP_POINTS_BONUS = 10;
 const COOP_REVIVE_TOUCH_DURATION = 1.2;
 const COOP_REVIVE_TOUCH_RADIUS_BONUS = 8;
 const LIVE_RELOAD_STATE_KEY = "pixel-bot-brawler:dev-state";
+const PROGRESSION_STATE_KEY = "pixel-bot-brawler:progression";
+const AUDIO_SETTINGS_KEY = "pixel-bot-brawler:audio-settings";
 const AudioContextClass = window.AudioContext || (window as typeof window & {
   webkitAudioContext?: typeof AudioContext;
 }).webkitAudioContext;
@@ -151,6 +154,7 @@ type Bullet = {
   piercedTargetIds?: string;
   laserResolved?: boolean;
   canPierce?: boolean;
+  autoAimTargetId?: number;
 };
 
 type Wall = {
@@ -262,8 +266,29 @@ type MenuScreen =
   | "join"
   | "guest-share"
   | "relay-answer"
+  | "death"
+  | "settings"
   | "rules";
 type ScannerMode = "invite" | "reply" | null;
+type ProgressionState = {
+  playerDamageUpgradeLevel: number;
+  playerMaxHpUpgradeLevel: number;
+  helperUpgradeLevel: number;
+  ownsDoubleBulletsItem: boolean;
+  ownsSpeedBoostItem: boolean;
+  ownsAutoAimItem: boolean;
+  equipsDoubleBulletsItem: boolean;
+  equipsSpeedBoostItem: boolean;
+  equipsAutoAimItem: boolean;
+};
+type AudioSettings = {
+  shootSfxEnabled: boolean;
+  lightningSfxEnabled: boolean;
+  meteorSfxEnabled: boolean;
+  damageTakenSfxEnabled: boolean;
+  damageDealtSfxEnabled: boolean;
+  damageFlashEnabled: boolean;
+};
 type NetworkPacket =
   | {
       type: "input";
@@ -510,6 +535,26 @@ let skullBossBurstWindup = 0;
 let bossesDefeated = 0;
 let liveReloadSaveTimer = 0;
 let shopDenySoundCooldown = 0;
+let playerDamageUpgradeLevel = 0;
+let playerMaxHpUpgradeLevel = 0;
+let helperUpgradeLevel = 0;
+let survivalDollarAccumulator = 0;
+let deathShopDollars = 0;
+let runEarnedDollars = 0;
+let lastRunEarnedDollars = 0;
+let lastRunSurvivalSeconds = 0;
+let ownsDoubleBulletsItem = false;
+let ownsSpeedBoostItem = false;
+let ownsAutoAimItem = false;
+let equipsDoubleBulletsItem = false;
+let equipsSpeedBoostItem = false;
+let equipsAutoAimItem = false;
+let shootSfxEnabled = true;
+let lightningSfxEnabled = true;
+let meteorSfxEnabled = true;
+let damageTakenSfxEnabled = true;
+let damageDealtSfxEnabled = true;
+let damageFlashEnabled = true;
 let multiplayerRole: MultiplayerRole = "solo";
 let networkStatus: NetworkStatus = "offline";
 let networkMessage = "Solo run";
@@ -609,6 +654,9 @@ const rulesLines = [
   "USE MOUSE WHEEL TO SCROLL THESE RULES."
 ];
 
+hydrateProgressionState();
+hydrateAudioSettings();
+
 const menuOverlay = document.createElement("section");
 menuOverlay.className = "menu-overlay";
 document.body.append(menuOverlay);
@@ -621,6 +669,501 @@ function updateQrImage(link: string) {
 
 function getShortSessionLabel(sessionId: string) {
   return sessionId ? sessionId.slice(0, 6).toUpperCase() : "------";
+}
+
+function loadProgressionState(): ProgressionState {
+  try {
+    const raw = localStorage.getItem(PROGRESSION_STATE_KEY);
+    if (!raw) {
+      return {
+        playerDamageUpgradeLevel: 0,
+        playerMaxHpUpgradeLevel: 0,
+        helperUpgradeLevel: 0,
+        ownsDoubleBulletsItem: false,
+        ownsSpeedBoostItem: false,
+        ownsAutoAimItem: false,
+        equipsDoubleBulletsItem: false,
+        equipsSpeedBoostItem: false,
+        equipsAutoAimItem: false
+      };
+    }
+
+    const parsed = JSON.parse(raw) as Partial<ProgressionState>;
+    return {
+      playerDamageUpgradeLevel: Math.max(0, Math.floor(parsed.playerDamageUpgradeLevel ?? 0)),
+      playerMaxHpUpgradeLevel: Math.max(0, Math.floor(parsed.playerMaxHpUpgradeLevel ?? 0)),
+      helperUpgradeLevel: Math.max(0, Math.floor(parsed.helperUpgradeLevel ?? 0)),
+      ownsDoubleBulletsItem: Boolean(parsed.ownsDoubleBulletsItem),
+      ownsSpeedBoostItem: Boolean(parsed.ownsSpeedBoostItem),
+      ownsAutoAimItem: Boolean(parsed.ownsAutoAimItem),
+      equipsDoubleBulletsItem: Boolean(parsed.equipsDoubleBulletsItem && parsed.ownsDoubleBulletsItem),
+      equipsSpeedBoostItem: Boolean(parsed.equipsSpeedBoostItem && parsed.ownsSpeedBoostItem),
+      equipsAutoAimItem: Boolean(parsed.equipsAutoAimItem && parsed.ownsAutoAimItem)
+    };
+  } catch {
+    return {
+      playerDamageUpgradeLevel: 0,
+      playerMaxHpUpgradeLevel: 0,
+      helperUpgradeLevel: 0,
+      ownsDoubleBulletsItem: false,
+      ownsSpeedBoostItem: false,
+      ownsAutoAimItem: false,
+      equipsDoubleBulletsItem: false,
+      equipsSpeedBoostItem: false,
+      equipsAutoAimItem: false
+    };
+  }
+}
+
+function saveProgressionState() {
+  try {
+    localStorage.setItem(
+      PROGRESSION_STATE_KEY,
+      JSON.stringify({
+        playerDamageUpgradeLevel,
+        playerMaxHpUpgradeLevel,
+        helperUpgradeLevel,
+        ownsDoubleBulletsItem,
+        ownsSpeedBoostItem,
+        ownsAutoAimItem,
+        equipsDoubleBulletsItem,
+        equipsSpeedBoostItem,
+        equipsAutoAimItem
+      } satisfies ProgressionState)
+    );
+  } catch {
+    // Ignore storage failures and keep progression in memory.
+  }
+}
+
+function hydrateProgressionState() {
+  const saved = loadProgressionState();
+  playerDamageUpgradeLevel = saved.playerDamageUpgradeLevel;
+  playerMaxHpUpgradeLevel = saved.playerMaxHpUpgradeLevel;
+  helperUpgradeLevel = saved.helperUpgradeLevel;
+  ownsDoubleBulletsItem = saved.ownsDoubleBulletsItem;
+  ownsSpeedBoostItem = saved.ownsSpeedBoostItem;
+  ownsAutoAimItem = saved.ownsAutoAimItem;
+  equipsDoubleBulletsItem = saved.equipsDoubleBulletsItem;
+  equipsSpeedBoostItem = saved.equipsSpeedBoostItem;
+  equipsAutoAimItem = saved.equipsAutoAimItem;
+}
+
+function loadAudioSettings(): AudioSettings {
+  try {
+    const raw = localStorage.getItem(AUDIO_SETTINGS_KEY);
+    if (!raw) {
+      return {
+        shootSfxEnabled: true,
+        lightningSfxEnabled: true,
+        meteorSfxEnabled: true,
+        damageTakenSfxEnabled: true,
+        damageDealtSfxEnabled: true,
+        damageFlashEnabled: true
+      };
+    }
+
+    const parsed = JSON.parse(raw) as Partial<AudioSettings>;
+    return {
+      shootSfxEnabled: parsed.shootSfxEnabled ?? true,
+      lightningSfxEnabled: parsed.lightningSfxEnabled ?? true,
+      meteorSfxEnabled: parsed.meteorSfxEnabled ?? true,
+      damageTakenSfxEnabled: parsed.damageTakenSfxEnabled ?? true,
+      damageDealtSfxEnabled: parsed.damageDealtSfxEnabled ?? true,
+      damageFlashEnabled: parsed.damageFlashEnabled ?? true
+    };
+  } catch {
+    return {
+      shootSfxEnabled: true,
+      lightningSfxEnabled: true,
+      meteorSfxEnabled: true,
+      damageTakenSfxEnabled: true,
+      damageDealtSfxEnabled: true,
+      damageFlashEnabled: true
+    };
+  }
+}
+
+function saveAudioSettings() {
+  try {
+    localStorage.setItem(
+      AUDIO_SETTINGS_KEY,
+      JSON.stringify({
+        shootSfxEnabled,
+        lightningSfxEnabled,
+        meteorSfxEnabled,
+        damageTakenSfxEnabled,
+        damageDealtSfxEnabled,
+        damageFlashEnabled
+      } satisfies AudioSettings)
+    );
+  } catch {
+    // Ignore storage failures and keep audio settings in memory.
+  }
+}
+
+function hydrateAudioSettings() {
+  const saved = loadAudioSettings();
+  shootSfxEnabled = saved.shootSfxEnabled;
+  lightningSfxEnabled = saved.lightningSfxEnabled;
+  meteorSfxEnabled = saved.meteorSfxEnabled;
+  damageTakenSfxEnabled = saved.damageTakenSfxEnabled;
+  damageDealtSfxEnabled = saved.damageDealtSfxEnabled;
+  damageFlashEnabled = saved.damageFlashEnabled;
+}
+
+function toggleAudioSetting(kind: "shoot" | "lightning" | "meteor" | "damageTaken" | "damageDealt" | "damageFlash") {
+  if (kind === "shoot") {
+    shootSfxEnabled = !shootSfxEnabled;
+  } else if (kind === "lightning") {
+    lightningSfxEnabled = !lightningSfxEnabled;
+  } else if (kind === "meteor") {
+    meteorSfxEnabled = !meteorSfxEnabled;
+  } else if (kind === "damageTaken") {
+    damageTakenSfxEnabled = !damageTakenSfxEnabled;
+  } else if (kind === "damageDealt") {
+    damageDealtSfxEnabled = !damageDealtSfxEnabled;
+  } else {
+    damageFlashEnabled = !damageFlashEnabled;
+  }
+
+  saveAudioSettings();
+  renderMenu();
+}
+
+function resetProgressionState() {
+  playerDamageUpgradeLevel = 0;
+  playerMaxHpUpgradeLevel = 0;
+  helperUpgradeLevel = 0;
+  ownsDoubleBulletsItem = false;
+  ownsSpeedBoostItem = false;
+  ownsAutoAimItem = false;
+  equipsDoubleBulletsItem = false;
+  equipsSpeedBoostItem = false;
+  equipsAutoAimItem = false;
+  deathShopDollars = 0;
+  runEarnedDollars = 0;
+  lastRunEarnedDollars = 0;
+  lastRunSurvivalSeconds = 0;
+  survivalDollarAccumulator = 0;
+  saveProgressionState();
+}
+
+function getPlayerDamageBonus() {
+  return playerDamageUpgradeLevel * 10;
+}
+
+function getPlayerMaxHpBonus() {
+  return playerMaxHpUpgradeLevel * 10;
+}
+
+function getHelperBuffBonus() {
+  return helperUpgradeLevel * 2;
+}
+
+function isPrimaryLoadoutOwner(fighter: Fighter) {
+  return fighter.isPlayer && fighter.playerSlot === 0;
+}
+
+function hasDoubleBulletsItemEquipped() {
+  return ownsDoubleBulletsItem && equipsDoubleBulletsItem;
+}
+
+function hasSpeedBoostItemEquipped() {
+  return ownsSpeedBoostItem && equipsSpeedBoostItem;
+}
+
+function hasAutoAimItemEquipped() {
+  return ownsAutoAimItem && equipsAutoAimItem;
+}
+
+function getEnemyHpItemMultiplier() {
+  return hasAutoAimItemEquipped() ? 1.25 : 1;
+}
+
+function getEnemyDamageItemMultiplier() {
+  return hasSpeedBoostItemEquipped() ? 2 : 1;
+}
+
+function getClosestActiveEnemy(x: number, y: number) {
+  const enemies = fighters.filter((fighter) => fighter.team === "enemy" && isFighterActive(fighter));
+  if (enemies.length <= 0) {
+    return null;
+  }
+
+  return enemies
+    .slice()
+    .sort((a, b) => Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y))[0];
+}
+
+function getAutoAimTargetAtShotMoment(x: number, y: number) {
+  return getClosestActiveEnemy(x, y);
+}
+
+function getPlayerShotDirection(fighter: Fighter) {
+  if (!isPrimaryLoadoutOwner(fighter) || !hasAutoAimItemEquipped()) {
+    return fighter.dir;
+  }
+
+  const target = getAutoAimTargetAtShotMoment(fighter.x, fighter.y);
+  if (!target) {
+    return fighter.dir;
+  }
+
+  return Math.atan2(target.y - fighter.y, target.x - fighter.x);
+}
+
+function getEnemyDamageTakenMultiplier(target: Fighter) {
+  if (target.team !== "player" && target.team !== "ally") {
+    return 1;
+  }
+
+  return getEnemyDamageItemMultiplier();
+}
+
+function bulletBelongsToPrimaryLoadout(bullet: Bullet) {
+  const owner = fighters.find((fighter) => fighter.id === bullet.ownerId);
+  return owner ? isPrimaryLoadoutOwner(owner) : false;
+}
+
+function steerBulletTowardEnemy(bullet: Bullet) {
+  if (
+    !hasAutoAimItemEquipped() ||
+    !bulletBelongsToPrimaryLoadout(bullet) ||
+    bullet.weapon === "laser" ||
+    bullet.autoAimTargetId === undefined
+  ) {
+    return;
+  }
+
+  const target = fighters.find(
+    (fighter) => fighter.id === bullet.autoAimTargetId && fighter.team === "enemy" && isFighterActive(fighter)
+  );
+  if (!target) {
+    return;
+  }
+
+  const speed = Math.hypot(bullet.vx, bullet.vy) || 1;
+  const direction = Math.atan2(target.y - bullet.y, target.x - bullet.x);
+  bullet.vx = Math.cos(direction) * speed;
+  bullet.vy = Math.sin(direction) * speed;
+}
+
+function applyPersistentPlayerUpgrades(player: Fighter) {
+  player.maxHp += getPlayerMaxHpBonus();
+  player.hp = player.maxHp;
+}
+
+function resetRunDollarTracking() {
+  survivalDollarAccumulator = 0;
+  runEarnedDollars = 0;
+}
+
+function syncRunDollarsToSurvivalTime() {
+  const clampedSurvival = Math.max(0, survivalWithoutDeath);
+  runEarnedDollars = Math.floor(clampedSurvival);
+  survivalDollarAccumulator = clampedSurvival - runEarnedDollars;
+}
+
+function awardSurvivalDollars(dt: number) {
+  if (multiplayerRole !== "solo") {
+    return;
+  }
+
+  survivalDollarAccumulator += dt;
+  let earned = 0;
+
+  while (survivalDollarAccumulator >= 1) {
+    survivalDollarAccumulator -= 1;
+    earned += 1;
+  }
+
+  if (earned <= 0) {
+    return;
+  }
+
+  runEarnedDollars += earned;
+}
+
+function tryBuyDeathShopUpgrade(upgrade: "damage" | "maxHp" | "helper") {
+  if (deathShopDollars < DEATH_SHOP_ITEM_COST) {
+    playShopDeniedSound();
+    return false;
+  }
+
+  deathShopDollars -= DEATH_SHOP_ITEM_COST;
+
+  if (upgrade === "damage") {
+    playerDamageUpgradeLevel += 1;
+  } else if (upgrade === "maxHp") {
+    playerMaxHpUpgradeLevel += 1;
+  } else {
+    helperUpgradeLevel += 1;
+  }
+
+  saveProgressionState();
+  playShopBuySound();
+  renderMenu();
+  return true;
+}
+
+function getItemOwnership(item: "doubleBullets" | "speedBoost" | "autoAim") {
+  if (item === "doubleBullets") {
+    return ownsDoubleBulletsItem;
+  }
+  if (item === "speedBoost") {
+    return ownsSpeedBoostItem;
+  }
+  return ownsAutoAimItem;
+}
+
+function setItemOwnership(item: "doubleBullets" | "speedBoost" | "autoAim", owned: boolean) {
+  if (item === "doubleBullets") {
+    ownsDoubleBulletsItem = owned;
+    if (!owned) equipsDoubleBulletsItem = false;
+    return;
+  }
+  if (item === "speedBoost") {
+    ownsSpeedBoostItem = owned;
+    if (!owned) equipsSpeedBoostItem = false;
+    return;
+  }
+  ownsAutoAimItem = owned;
+  if (!owned) equipsAutoAimItem = false;
+}
+
+function getItemEquipState(item: "doubleBullets" | "speedBoost" | "autoAim") {
+  if (item === "doubleBullets") {
+    return ownsDoubleBulletsItem && equipsDoubleBulletsItem;
+  }
+  if (item === "speedBoost") {
+    return ownsSpeedBoostItem && equipsSpeedBoostItem;
+  }
+  return ownsAutoAimItem && equipsAutoAimItem;
+}
+
+function setItemEquipState(item: "doubleBullets" | "speedBoost" | "autoAim", equipped: boolean) {
+  if (item === "doubleBullets") {
+    equipsDoubleBulletsItem = ownsDoubleBulletsItem && equipped;
+    return;
+  }
+  if (item === "speedBoost") {
+    equipsSpeedBoostItem = ownsSpeedBoostItem && equipped;
+    return;
+  }
+  equipsAutoAimItem = ownsAutoAimItem && equipped;
+}
+
+function tryBuyDeathShopItem(item: "doubleBullets" | "speedBoost" | "autoAim", cost: number) {
+  if (getItemOwnership(item) || deathShopDollars < cost) {
+    playShopDeniedSound();
+    return false;
+  }
+
+  deathShopDollars -= cost;
+  setItemOwnership(item, true);
+  setItemEquipState(item, true);
+  saveProgressionState();
+  playShopBuySound();
+  renderMenu();
+  return true;
+}
+
+function toggleDeathShopItem(item: "doubleBullets" | "speedBoost" | "autoAim") {
+  if (!getItemOwnership(item)) {
+    playShopDeniedSound();
+    return false;
+  }
+
+  setItemEquipState(item, !getItemEquipState(item));
+  saveProgressionState();
+  playPickupSound();
+  renderMenu();
+  return true;
+}
+
+function openDeathMenuAfterSoloRun() {
+  lastRunEarnedDollars = runEarnedDollars;
+  lastRunSurvivalSeconds = Math.floor(survivalWithoutDeath);
+  deathShopDollars = runEarnedDollars;
+
+  for (const fighter of fighters) {
+    if (!fighter.isPlayer) {
+      continue;
+    }
+
+    fighter.hp = 0;
+    fighter.vx = 0;
+    fighter.vy = 0;
+    fighter.knockbackVx = 0;
+    fighter.knockbackVy = 0;
+    fighter.reload = 0;
+    fighter.attackCooldown = 0;
+    fighter.shieldTimer = 0;
+    fighter.rageTimer = 0;
+    fighter.flash = 0.18;
+    fighter.downed = false;
+    fighter.reviveProgress = 0;
+    fighter.respawn = 0;
+  }
+
+  clearRunStateOnPlayerDeath();
+  pendingRunReset = false;
+  gameStarted = false;
+  menuOpen = true;
+  isPaused = true;
+  input.shoot = false;
+  resetMovementInputState();
+  menuScreen = "death";
+  renderMenu();
+}
+
+function getDeathShopButtonMarkup(
+  action: "buy-damage" | "buy-max-hp" | "buy-helper",
+  title: string,
+  detail: string,
+  level: number
+) {
+  const disabled = deathShopDollars < DEATH_SHOP_ITEM_COST ? "disabled" : "";
+  return `
+    <button type="button" class="menu-shop-item" data-action="${action}" ${disabled}>
+      <strong>${title}</strong>
+      <span class="menu-shop-meta">${detail}</span>
+      <span class="menu-shop-meta">Lv ${level} • $${DEATH_SHOP_ITEM_COST}</span>
+    </button>
+  `;
+}
+
+function getDeathShopItemButtonMarkup(
+  item: "doubleBullets" | "speedBoost" | "autoAim",
+  title: string,
+  detail: string,
+  cost: number
+) {
+  const owned = getItemOwnership(item);
+  const equipped = getItemEquipState(item);
+  const action = owned
+    ? item === "doubleBullets"
+      ? "toggle-double-bullets-item"
+      : item === "speedBoost"
+        ? "toggle-speed-item"
+        : "toggle-auto-aim-item"
+    : item === "doubleBullets"
+      ? "buy-double-bullets-item"
+      : item === "speedBoost"
+        ? "buy-speed-item"
+        : "buy-auto-aim-item";
+  const disabled = !owned && deathShopDollars < cost ? "disabled" : "";
+  const stateLabel = owned ? (equipped ? "Equipped" : "Unequipped") : `$${cost}`;
+  const buttonLabel = owned ? (equipped ? "Unequip" : "Equip") : "Buy";
+
+  return `
+    <button type="button" class="menu-shop-item" data-action="${action}" ${disabled}>
+      <strong>${title}</strong>
+      <span class="menu-shop-meta">${detail}</span>
+      <span class="menu-shop-meta">${stateLabel} • ${buttonLabel}</span>
+    </button>
+  `;
 }
 
 function getScannerMarkup(mode: ScannerMode) {
@@ -639,6 +1182,25 @@ function getScannerMarkup(mode: ScannerMode) {
   `;
 }
 
+function getSettingsToggleButtonMarkup(
+  action:
+    | "toggle-shoot-sfx"
+    | "toggle-lightning-sfx"
+    | "toggle-meteor-sfx"
+    | "toggle-damage-taken-sfx"
+    | "toggle-damage-dealt-sfx"
+    | "toggle-damage-flash",
+  title: string,
+  enabled: boolean
+) {
+  return `
+    <button type="button" class="menu-shop-item" data-action="${action}">
+      <strong>${title}</strong>
+      <span class="menu-shop-meta">${enabled ? "On" : "Off"}</span>
+    </button>
+  `;
+}
+
 function renderMenu() {
   menuOverlay.hidden = !menuOpen;
   menuOverlay.style.display = menuOpen ? "grid" : "none";
@@ -646,6 +1208,62 @@ function renderMenu() {
   const qrMarkup = qrImageUrl
     ? `<img class="menu-qr" src="${qrImageUrl}" alt="QR code for multiplayer link" referrerpolicy="no-referrer">`
     : "";
+
+  if (menuScreen === "death") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Run Over</p>
+        <h1>Death Shop</h1>
+        <div class="menu-shop-summary">This Run: $${deathShopDollars}</div>
+        <p class="menu-copy">Upgrades</p>
+        <div class="menu-shop-list">
+          ${getDeathShopButtonMarkup(
+            "buy-damage",
+            "+10 Damage",
+            `Next runs hit for +${getPlayerDamageBonus() + 10} bonus damage`,
+            playerDamageUpgradeLevel
+          )}
+          ${getDeathShopButtonMarkup(
+            "buy-max-hp",
+            "+10 Max HP",
+            `Next runs start with ${100 + getPlayerMaxHpBonus() + 10} max HP`,
+            playerMaxHpUpgradeLevel
+          )}
+          ${getDeathShopButtonMarkup(
+            "buy-helper",
+            "Helper Buff",
+            `Healing +${getHelperBuffBonus() + 2} and shooter damage +${getHelperBuffBonus() + 2}`,
+            helperUpgradeLevel
+          )}
+        </div>
+        <p class="menu-copy">Items</p>
+        <div class="menu-shop-list">
+          ${getDeathShopItemButtonMarkup(
+            "doubleBullets",
+            "Twin Shot",
+            "Doubles bullets with a small split angle.",
+            20
+          )}
+          ${getDeathShopItemButtonMarkup(
+            "speedBoost",
+            "Speed Burst",
+            "Move 2x faster, but enemies deal 2x damage.",
+            10
+          )}
+          ${getDeathShopItemButtonMarkup(
+            "autoAim",
+            "Auto Aim",
+            "Bullets home onto enemies, but enemies gain 1.25x HP.",
+            20
+          )}
+        </div>
+        <div class="menu-actions">
+          <button type="button" data-action="restart-run">Play Again</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
 
   if (menuScreen === "home") {
     menuOverlay.innerHTML = `
@@ -656,8 +1274,30 @@ function renderMenu() {
         <div class="menu-actions">
           ${gameStarted ? '<button type="button" data-action="resume-game">Resume</button>' : ""}
           <button type="button" data-action="new-game">New Game</button>
+          <button type="button" data-action="show-settings">Settings</button>
           <button type="button" data-action="show-rules">Rules</button>
           <button type="button" data-action="play-friend">Play with Friend</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  if (menuScreen === "settings") {
+    menuOverlay.innerHTML = `
+      <div class="menu-panel">
+        <p class="menu-kicker">Settings</p>
+        <h1>Sound Effects</h1>
+        <div class="menu-shop-list">
+          ${getSettingsToggleButtonMarkup("toggle-shoot-sfx", "Shoot SFX", shootSfxEnabled)}
+          ${getSettingsToggleButtonMarkup("toggle-lightning-sfx", "Lightning SFX", lightningSfxEnabled)}
+          ${getSettingsToggleButtonMarkup("toggle-meteor-sfx", "Meteor SFX", meteorSfxEnabled)}
+          ${getSettingsToggleButtonMarkup("toggle-damage-taken-sfx", "Damage Taken SFX", damageTakenSfxEnabled)}
+          ${getSettingsToggleButtonMarkup("toggle-damage-dealt-sfx", "Damage Dealt SFX", damageDealtSfxEnabled)}
+          ${getSettingsToggleButtonMarkup("toggle-damage-flash", "Damage Flash", damageFlashEnabled)}
+        </div>
+        <div class="menu-actions">
+          <button type="button" data-action="back-settings" class="ghost">Back</button>
         </div>
       </div>
     `;
@@ -963,10 +1603,11 @@ function getProgressBarState() {
 function applyEnemyScaling(enemy: Fighter, waveIndex = 0) {
   const pressure = getEnemyPressureLevel();
   const elite = pressure >= 3 && (waveIndex === getWaveEnemyCount() - 1 || Math.random() < 0.16 + bossesDefeated * 0.06);
+  const hpMultiplier = getEnemyHpItemMultiplier();
 
   enemy.archetype = pressure >= 2 && Math.random() < 0.4 ? "ranged" : Math.random() < 0.78 ? "melee" : "ranged";
   enemy.radius = elite ? 9 : 7;
-  enemy.maxHp = (elite ? 150 : 100) + pressure * (elite ? 22 : 14);
+  enemy.maxHp = Math.round(((elite ? 150 : 100) + pressure * (elite ? 22 : 14)) * hpMultiplier);
   enemy.hp = enemy.maxHp;
   enemy.speed = (elite ? 56 : 50) + pressure * (elite ? 2.4 : 1.6);
   enemy.damageMultiplier = (elite ? 1.28 : 1) + pressure * 0.08;
@@ -1025,6 +1666,8 @@ function spawnRoster() {
   shieldPickupCooldown = 18;
   pendingRunReset = false;
   survivalWithoutDeath = 0;
+  deathShopDollars = 0;
+  resetRunDollarTracking();
   bossFightStarted = false;
   bossFightWon = false;
   bossIntroTimer = 0;
@@ -1044,6 +1687,7 @@ function spawnRoster() {
   bossesDefeated = 0;
   const playerSpawn = getRandomSpawnPoint(7);
   const player = createFighter(playerSpawn.x, playerSpawn.y, true, 0);
+  applyPersistentPlayerUpgrades(player);
   player.controller = multiplayerRole === "guest" ? "none" : "local";
   player.playerSlot = 0;
   fighters.push(player);
@@ -1125,6 +1769,7 @@ function applyDevStage(stageIndex: number) {
   }
   shopDenySoundCooldown = 0;
   survivalWithoutDeath = snapshot.survival;
+  syncRunDollarsToSurvivalTime();
   bossesDefeated = snapshot.bossesDefeated;
   bossFightStarted = false;
   bossFightWon = false;
@@ -1202,19 +1847,38 @@ function getCurrentDevStageIndex() {
 }
 
 function stepDevStage(direction: -1 | 1) {
-  const nextStage = clamp(getCurrentDevStageIndex() + direction, 0, devStageSnapshots.length - 1);
+  const currentStage = getCurrentDevStageIndex();
+  const lastStageIndex = devStageSnapshots.length - 1;
+  const lastStageSurvival = devStageSnapshots[lastStageIndex].survival;
+
+  if (direction > 0 && (currentStage === lastStageIndex || survivalWithoutDeath >= lastStageSurvival)) {
+    survivalWithoutDeath += 30;
+    syncRunDollarsToSurvivalTime();
+    ensureEnemyWavePresent();
+    return;
+  }
+
+  if (direction < 0 && currentStage === lastStageIndex && survivalWithoutDeath > lastStageSurvival) {
+    survivalWithoutDeath = Math.max(lastStageSurvival, survivalWithoutDeath - 30);
+    syncRunDollarsToSurvivalTime();
+    ensureEnemyWavePresent();
+    return;
+  }
+
+  const nextStage = clamp(currentStage + direction, 0, lastStageIndex);
   applyDevStage(nextStage);
 }
 
 function configureIronBoss(boss: Fighter) {
+  const hpMultiplier = getEnemyHpItemMultiplier();
   boss.isBoss = true;
   boss.bossKind = "iron";
   boss.team = "enemy";
   boss.archetype = "melee";
   boss.radius = 18;
   boss.speed = 0;
-  boss.hp = 3750;
-  boss.maxHp = 3750;
+  boss.hp = Math.round(3750 * hpMultiplier);
+  boss.maxHp = Math.round(3750 * hpMultiplier);
   boss.color = "#6d7686";
   boss.accent = "#cfd7df";
   boss.dir = -Math.PI / 2;
@@ -1223,14 +1887,15 @@ function configureIronBoss(boss: Fighter) {
 }
 
 function configureSkullBoss(boss: Fighter) {
+  const hpMultiplier = getEnemyHpItemMultiplier();
   boss.isBoss = true;
   boss.bossKind = "skull";
   boss.team = "enemy";
   boss.archetype = "ranged";
   boss.radius = 20;
   boss.speed = 0;
-  boss.hp = 2200;
-  boss.maxHp = 2200;
+  boss.hp = Math.round(2200 * hpMultiplier);
+  boss.maxHp = Math.round(2200 * hpMultiplier);
   boss.color = "#5b5d68";
   boss.accent = "#ece6d8";
   boss.headMark = "skull";
@@ -1568,6 +2233,10 @@ function playNoiseBurst(duration: number, volume: number, filterType: BiquadFilt
 }
 
 function playShootSound(isPlayer: boolean) {
+  if (!shootSfxEnabled) {
+    return;
+  }
+
   if (isPlayer) {
     playTone("square", 700, 0.075, 0.032, 430);
     playTone("triangle", 1040, 0.028, 0.009, 690);
@@ -1576,7 +2245,15 @@ function playShootSound(isPlayer: boolean) {
   }
 }
 
-function playHitSound(isMelee: boolean) {
+function playHitSound(isMelee: boolean, kind: "taken" | "dealt") {
+  if (kind === "taken" && !damageTakenSfxEnabled) {
+    return;
+  }
+
+  if (kind === "dealt" && !damageDealtSfxEnabled) {
+    return;
+  }
+
   playTone(isMelee ? "triangle" : "sawtooth", isMelee ? 180 : 240, 0.07, isMelee ? 0.03 : 0.024, isMelee ? 120 : 170);
   playNoiseBurst(0.045, isMelee ? 0.011 : 0.008, "highpass", isMelee ? 620 : 900);
 }
@@ -1587,12 +2264,20 @@ function playDefeatSound() {
 }
 
 function playLightningSound() {
+  if (!lightningSfxEnabled) {
+    return;
+  }
+
   playTone("sawtooth", 920, 0.12, 0.04, 260);
   playTone("triangle", 240, 0.16, 0.024, 100);
   playNoiseBurst(0.12, 0.018, "highpass", 1100);
 }
 
 function playMeteorSound() {
+  if (!meteorSfxEnabled) {
+    return;
+  }
+
   playTone("sawtooth", 190, 0.16, 0.038, 110);
   playTone("triangle", 98, 0.23, 0.028, 64);
   playNoiseBurst(0.2, 0.02, "lowpass", 260);
@@ -1685,6 +2370,14 @@ function createBulletInArray(
   projectileIndex: number
 ) {
   const isCrit = rollBulletCrit(fighter, sourceInputSeq, projectileIndex);
+  const totalDamage =
+    fighter.isPlayer && fighter.playerSlot === 0
+      ? damage + getPlayerDamageBonus()
+      : damage;
+  const autoAimTarget =
+    fighter.isPlayer && fighter.playerSlot === 0 && hasAutoAimItemEquipped() && weapon !== "laser"
+      ? getAutoAimTargetAtShotMoment(fighter.x, fighter.y)
+      : null;
   const bullet = {
     id: nextId++,
     shotId,
@@ -1695,15 +2388,16 @@ function createBulletInArray(
     vy: Math.sin(direction) * speed,
     ownerId: fighter.id,
     life,
-    color: weapon === "laser" ? "#66f6ff" : fighter.accent,
-    damage: (isCrit ? damage * 2 : damage) * fighter.damageMultiplier,
+    color: weapon === "laser" ? "#ffffff" : fighter.accent,
+    damage: (isCrit ? totalDamage * 2 : totalDamage) * fighter.damageMultiplier,
     size,
     weapon,
     isCrit,
     healAmount: 0,
     trailLength: weapon === "laser" ? 0 : undefined,
     piercedTargetIds: weapon === "laser" ? "" : undefined,
-    laserResolved: weapon === "laser" ? false : undefined
+    laserResolved: weapon === "laser" ? false : undefined,
+    autoAimTargetId: autoAimTarget?.id
   };
   target.push(bullet);
   return bullet;
@@ -1893,6 +2587,7 @@ function shoot(
 
   if (fighter.isPlayer) {
     const weapon = getActivePlayerWeapon(fighter);
+    const shotDirection = getPlayerShotDirection(fighter);
     const rageReloadFactor = fighter.rageTimer > 0 ? 0.45 : 1;
     const rageSpeedFactor = fighter.rageTimer > 0 ? 2 : 1;
     const playerSpeedFactor = 1.5;
@@ -1910,7 +2605,7 @@ function shoot(
         createBulletInArray(
           bulletTarget,
           fighter,
-          fighter.dir,
+          shotDirection,
           176 * playerSpeedFactor * rageSpeedFactor,
           10,
           24,
@@ -1924,11 +2619,11 @@ function shoot(
     } else if (weapon === "shotgun") {
       fighter.reload = (0.28 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
-        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 0),
-        createBulletInArray(bulletTarget, fighter, fighter.dir - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 1),
-        createBulletInArray(bulletTarget, fighter, fighter.dir, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 2),
-        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 3),
-        createBulletInArray(bulletTarget, fighter, fighter.dir + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 4)
+        createBulletInArray(bulletTarget, fighter, shotDirection - 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 0),
+        createBulletInArray(bulletTarget, fighter, shotDirection - 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 1),
+        createBulletInArray(bulletTarget, fighter, shotDirection, 164 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 2),
+        createBulletInArray(bulletTarget, fighter, shotDirection + 0.12, 158 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 3),
+        createBulletInArray(bulletTarget, fighter, shotDirection + 0.24, 152 * playerSpeedFactor * rageSpeedFactor, 10, 20, 3, weapon, shotId, sourceInputSeq, 4)
       );
     } else if (weapon === "smg") {
       fighter.reload = (0.06 * rageReloadFactor) / attackSpeedFactor;
@@ -1936,7 +2631,7 @@ function shoot(
         createBulletInArray(
           bulletTarget,
           fighter,
-          fighter.dir + getShotSpreadOffset(sourceInputSeq, 0, 0.12),
+          shotDirection + getShotSpreadOffset(sourceInputSeq, 0, 0.12),
           188 * playerSpeedFactor * rageSpeedFactor,
           10,
           14,
@@ -1953,7 +2648,7 @@ function shoot(
         createBulletInArray(
           bulletTarget,
           fighter,
-          fighter.dir,
+          shotDirection,
           60000 * rageSpeedFactor,
           0.035,
           34,
@@ -1967,7 +2662,7 @@ function shoot(
     } else {
       fighter.reload = (0.275 * rageReloadFactor) / attackSpeedFactor;
       createdBullets.push(
-        createBulletInArray(bulletTarget, fighter, fighter.dir, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon, shotId, sourceInputSeq, 0)
+        createBulletInArray(bulletTarget, fighter, shotDirection, 132 * playerSpeedFactor * rageSpeedFactor, 10, 160, 5, weapon, shotId, sourceInputSeq, 0)
       );
     }
 
@@ -1977,6 +2672,36 @@ function shoot(
         bullet.color = "#a6f8ff";
         bullet.piercedTargetIds = "";
       }
+    }
+
+    if (isPrimaryLoadoutOwner(fighter) && hasDoubleBulletsItemEquipped()) {
+      const splitAngle = 0.06;
+      const clonedBullets: Bullet[] = [];
+
+      for (const bullet of createdBullets) {
+        const speed = Math.hypot(bullet.vx, bullet.vy) || 1;
+        const baseDirection = Math.atan2(bullet.vy, bullet.vx);
+        const leftDirection = baseDirection - splitAngle;
+        const rightDirection = baseDirection + splitAngle;
+
+        bullet.x = fighter.x + Math.cos(leftDirection) * 8;
+        bullet.y = fighter.y + Math.sin(leftDirection) * 8;
+        bullet.vx = Math.cos(leftDirection) * speed;
+        bullet.vy = Math.sin(leftDirection) * speed;
+
+        const clone = {
+          ...bullet,
+          id: nextId++,
+          x: fighter.x + Math.cos(rightDirection) * 8,
+          y: fighter.y + Math.sin(rightDirection) * 8,
+          vx: Math.cos(rightDirection) * speed,
+          vy: Math.sin(rightDirection) * speed
+        };
+        bulletTarget.push(clone);
+        clonedBullets.push(clone);
+      }
+
+      createdBullets.push(...clonedBullets);
     }
   } else {
     fighter.reload = 0.34;
@@ -2050,8 +2775,11 @@ function updateHumanFighterWithControls(
   const moveX = clamp(Number(controls.right) - Number(controls.left) + controls.moveX, -1, 1);
   const moveY = clamp(Number(controls.down) - Number(controls.up) + controls.moveY, -1, 1);
   const len = Math.hypot(moveX, moveY) || 1;
-  player.vx = (moveX / len) * player.speed;
-  player.vy = (moveY / len) * player.speed;
+  const moveSpeed = isPrimaryLoadoutOwner(player) && hasSpeedBoostItemEquipped()
+    ? player.speed * 2
+    : player.speed;
+  player.vx = (moveX / len) * moveSpeed;
+  player.vy = (moveY / len) * moveSpeed;
   player.dir = Math.atan2(controls.mouseY - player.y, controls.mouseX - player.x);
 
   if (commands) {
@@ -2246,15 +2974,22 @@ function updateBot(bot: Fighter, dt: number) {
   bot.vx = (moveDX / moveLen) * bot.speed;
   bot.vy = (moveDY / moveLen) * bot.speed;
 
-  if (bot.archetype === "melee") {
-    if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
-      bot.attackCooldown = 0.65;
-      const baseDamage = enemy.isPlayer ? 10 * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE : 10;
-      const damage = playerHasInfiniteHealth(enemy) ? 0 : enemy.rageTimer > 0 ? 0 : enemy.shieldTimer > 0 ? 0 : baseDamage;
-      enemy.hp -= damage;
+    if (bot.archetype === "melee") {
+      if (dist < bot.radius + enemy.radius + 6 && bot.attackCooldown <= 0) {
+        bot.attackCooldown = 0.65;
+        const baseDamage = enemy.isPlayer ? 10 * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE : 10;
+        const damage =
+          playerHasInfiniteHealth(enemy)
+            ? 0
+            : enemy.rageTimer > 0
+              ? 0
+              : enemy.shieldTimer > 0
+                ? 0
+                : baseDamage * getEnemyDamageTakenMultiplier(enemy);
+        enemy.hp -= damage;
       enemy.flash = 0.16;
       bot.flash = 0.08;
-      playHitSound(true);
+      playHitSound(true, "taken");
       if (enemy.rageTimer > 0) {
         applyKnockback(bot, enemy.x, enemy.y, 22);
       } else if (enemy.shieldTimer > 0) {
@@ -2278,6 +3013,8 @@ function updateHelper(helper: Fighter, dt: number) {
     return;
   }
 
+  const helperBuffBonus = getHelperBuffBonus();
+
   if (helper.helperType === "green") {
     helper.dir = Math.atan2(player.y - helper.y, player.x - helper.x);
     helper.targetX = player.x - Math.cos(elapsed * 2 + helper.id) * 18;
@@ -2291,7 +3028,7 @@ function updateHelper(helper: Fighter, dt: number) {
 
     if (helper.reload <= 0 && Math.hypot(player.x - helper.x, player.y - helper.y) < 80) {
       helper.reload = 0.8;
-      player.hp = Math.min(player.maxHp, player.hp + 10);
+      player.hp = Math.min(player.maxHp, player.hp + 10 + helperBuffBonus);
       player.flash = 0.08;
       const shotId = nextId++;
       bullets.push({
@@ -2309,7 +3046,7 @@ function updateHelper(helper: Fighter, dt: number) {
         size: 3,
         weapon: "pistol",
         isCrit: false,
-        healAmount: 5
+        healAmount: 5 + helperBuffBonus
       });
       playShootSound(false);
     }
@@ -2358,7 +3095,7 @@ function updateHelper(helper: Fighter, dt: number) {
       ownerId: helper.id,
       life: 1.3,
       color: "#ff7a7a",
-      damage: 18,
+      damage: 18 + helperBuffBonus,
       size: 3,
       weapon: "pistol",
       isCrit: false,
@@ -2569,6 +3306,7 @@ function spawnSkullBossProjectile(boss: Fighter) {
 }
 
 function spawnSkullMinions(count: number) {
+  const hpMultiplier = getEnemyHpItemMultiplier();
   const activeEnemies = fighters.filter((fighter) => fighter.team === "enemy" && fighter.respawn <= 0).length;
   const availableSlots = Math.max(0, MAX_SIMULTANEOUS_ENEMIES - activeEnemies);
   const spawnCount = Math.min(count, availableSlots);
@@ -2583,8 +3321,8 @@ function spawnSkullMinions(count: number) {
     minion.headMark = "skull";
     minion.radius = 8;
     minion.speed = 60;
-    minion.maxHp = 135;
-    minion.hp = 135;
+    minion.maxHp = Math.round(135 * hpMultiplier);
+    minion.hp = minion.maxHp;
     minion.damageMultiplier = 1.15;
     minion.color = "#4c4e57";
     minion.accent = "#d8d1c2";
@@ -2767,7 +3505,7 @@ function reflectBulletOffBoss(bullet: Bullet, boss: Fighter, originalOwner: Figh
   bullet.trailLength = 0;
   bullet.piercedTargetIds = "";
   bullet.laserResolved = false;
-  playHitSound(false);
+  playHitSound(false, "dealt");
 }
 
 function moveFighter(fighter: Fighter, dt: number) {
@@ -2842,6 +3580,7 @@ function clearRunStateOnPlayerDeath() {
   regenTickTimer = 1;
   shopDenySoundCooldown = 0;
   survivalWithoutDeath = 0;
+  resetRunDollarTracking();
   bossFightStarted = false;
   bossFightWon = false;
   bossIntroTimer = 0;
@@ -2910,6 +3649,10 @@ function downPlayer(target: Fighter) {
   target.reviveProgress = 0;
 
   if (shouldEndRunAfterPlayerDeath(target)) {
+    if (multiplayerRole === "solo") {
+      openDeathMenuAfterSoloRun();
+      return;
+    }
     beginFullRunReset();
     return;
   }
@@ -3119,13 +3862,17 @@ function applyProjectileDamage(
     target.isPlayer && owner?.team === "enemy" && !owner.isBoss
       ? coopScaledDamage * NON_BOSS_ENEMY_DAMAGE_TO_PLAYER_SCALE
       : coopScaledDamage;
+  const finalScaledDamage =
+    owner?.team === "enemy"
+      ? scaledDamage * getEnemyDamageTakenMultiplier(target)
+      : scaledDamage;
   const appliedDamage = playerHasInfiniteHealth(target)
     ? 0
     : target.rageTimer > 0
       ? 0
       : target.shieldTimer > 0
         ? 0
-        : scaledDamage;
+        : finalScaledDamage;
 
   target.hp -= appliedDamage;
   target.flash = 0.18;
@@ -3158,12 +3905,14 @@ function explodeBazooka(bullet: Bullet) {
 
     const falloff = 1 - distance / 30;
     const damage = Math.max(40, Math.round(bullet.damage * falloff));
-    applyProjectileDamage(fighter, damage, bullet.x, bullet.y, 14 * falloff, owner);
+    const knockback = Math.max(28, 56 * falloff);
+    applyProjectileDamage(fighter, damage, bullet.x, bullet.y, knockback, owner);
   }
 }
 
 function updateBullets(dt: number) {
   for (const bullet of bullets) {
+    steerBulletTowardEnemy(bullet);
     let previousX = bullet.x;
     let previousY = bullet.y;
     let hitObstacle = false;
@@ -3295,7 +4044,7 @@ function updateBullets(dt: number) {
       }
 
       if (laserConnected) {
-        playHitSound(false);
+        playHitSound(false, owner?.team === "enemy" ? "taken" : "dealt");
       }
       continue;
     }
@@ -3327,7 +4076,7 @@ function updateBullets(dt: number) {
 
     const directHitKnockback = target.rageTimer > 0 && target.isPlayer ? 0 : bullet.isCrit ? 8 : 0;
     applyProjectileDamage(target, bullet.damage, bullet.x, bullet.y, directHitKnockback, owner);
-    playHitSound(false);
+    playHitSound(false, owner?.team === "enemy" ? "taken" : "dealt");
 
     if (target.rageTimer > 0 && target.isPlayer) {
       if (bullet.canPierce) {
@@ -3777,7 +4526,7 @@ function updateLightning(dt: number, allowAutoSpawn = true) {
           player.hp -= Math.round(lightningSettings.damage * 0.8);
         }
         player.flash = 0.22;
-        playHitSound(false);
+        playHitSound(false, "taken");
 
         if (player.hp <= 0) {
           downPlayer(player);
@@ -3825,13 +4574,14 @@ function damageHazardTarget(target: Fighter, damage: number, sourceX: number, so
     target.hp = target.maxHp;
     return;
   }
-  const appliedDamage = target.rageTimer > 0 ? Math.max(0, Math.round(damage * 0.28)) : target.shieldTimer > 0 ? 0 : damage;
+  const scaledDamage = damage * getEnemyDamageTakenMultiplier(target);
+  const appliedDamage = target.rageTimer > 0 ? Math.max(0, Math.round(scaledDamage * 0.28)) : target.shieldTimer > 0 ? 0 : scaledDamage;
   target.hp -= appliedDamage;
   target.flash = 0.2;
   if (knockback > 0) {
     applyKnockback(target, sourceX, sourceY, knockback);
   }
-  playHitSound(false);
+  playHitSound(false, "taken");
 
   if (target.hp <= 0) {
     defeatFighter(target, null);
@@ -3927,6 +4677,7 @@ function update(dt: number) {
 
   if (activeHumans.length > 0 && !shopActive) {
     survivalWithoutDeath += dt;
+    awardSurvivalDollars(dt);
   }
 
   if (activeHumans.length > 0 && !shopActive && !bossFightStarted && !bossFightWon) {
@@ -4115,6 +4866,10 @@ function drawSkullMark(centerX: number, centerY: number, scale: number) {
   ctx.fillRect(centerX + scale * 0.22, centerY + scale * 0.48, scale * 0.18, scale * 0.34);
 }
 
+function getDamageFlashColor(baseColor: string, flash: number) {
+  return damageFlashEnabled && flash > 0 ? "#ffffff" : baseColor;
+}
+
 function drawFighter(fighter: Fighter) {
   if (fighter.respawn > 0 && !fighter.downed) {
     return;
@@ -4152,7 +4907,7 @@ function drawFighter(fighter: Fighter) {
       ctx.ellipse(fighter.x, fighter.y + 10, fighter.radius + 10, fighter.radius - 1, 0, 0, TAU);
       ctx.fill();
 
-      ctx.fillStyle = fighter.flash > 0 ? "#ffffff" : "#595c68";
+      ctx.fillStyle = getDamageFlashColor("#595c68", fighter.flash);
       ctx.beginPath();
       ctx.arc(fighter.x, fighter.y, fighter.radius, 0, TAU);
       ctx.fill();
@@ -4207,7 +4962,7 @@ function drawFighter(fighter: Fighter) {
     ctx.lineTo(fighter.x + Math.cos(swordAngle) * 8, fighter.y + Math.sin(swordAngle) * 8);
     ctx.stroke();
 
-    ctx.fillStyle = fighter.flash > 0 ? "#ffffff" : "#7f8795";
+    ctx.fillStyle = getDamageFlashColor("#7f8795", fighter.flash);
     ctx.beginPath();
     ctx.arc(fighter.x, fighter.y, fighter.radius, 0, TAU);
     ctx.fill();
@@ -4229,7 +4984,7 @@ function drawFighter(fighter: Fighter) {
     return;
   }
 
-  const body = fighter.flash > 0 ? "#ffffff" : fighter.color;
+  const body = getDamageFlashColor(fighter.color, fighter.flash);
   const weaponReach = fighter.archetype === "melee" ? 4 : 6;
   const handX = fighter.x + Math.cos(fighter.dir) * weaponReach;
   const handY = fighter.y + Math.sin(fighter.dir) * weaponReach;
@@ -4261,6 +5016,56 @@ function drawFighter(fighter: Fighter) {
   if (fighter.archetype === "melee") {
     ctx.fillRect(handX - 1, handY - 4, 3, 8);
     ctx.fillRect(handX - 4, handY - 1, 8, 3);
+  } else if (fighter.team === "enemy") {
+    const gunAngle = fighter.dir;
+    const dirX = Math.cos(gunAngle);
+    const dirY = Math.sin(gunAngle);
+    const sideX = Math.cos(gunAngle + Math.PI / 2);
+    const sideY = Math.sin(gunAngle + Math.PI / 2);
+    const gripX = fighter.x + dirX * 1.5 - sideX * 1.5;
+    const gripY = fighter.y + dirY * 1.5 - sideY * 1.5;
+    const bodyStartX = fighter.x + dirX * 1.5;
+    const bodyStartY = fighter.y + dirY * 1.5;
+    const bodyEndX = fighter.x + dirX * 7.5;
+    const bodyEndY = fighter.y + dirY * 7.5;
+    const muzzleX = fighter.x + dirX * 10;
+    const muzzleY = fighter.y + dirY * 10;
+
+    ctx.strokeStyle = "#0d1218";
+    ctx.lineWidth = 5;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(bodyStartX, bodyStartY);
+    ctx.lineTo(bodyEndX, bodyEndY);
+    ctx.stroke();
+
+    ctx.strokeStyle = fighter.accent;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(bodyStartX, bodyStartY);
+    ctx.lineTo(bodyEndX, bodyEndY);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#dff7ff";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(bodyStartX + sideX * 0.5, bodyStartY + sideY * 0.5);
+    ctx.lineTo(bodyEndX + sideX * 0.5, bodyEndY + sideY * 0.5);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#0d1218";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(bodyEndX, bodyEndY);
+    ctx.lineTo(muzzleX, muzzleY);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#0d1218";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(gripX, gripY);
+    ctx.lineTo(gripX - dirY * 3, gripY + dirX * 3);
+    ctx.stroke();
   } else {
     ctx.fillRect(handX - 2, handY - 2, 4, 4);
   }
@@ -4633,7 +5438,7 @@ function drawBullets() {
       const tailX = bullet.x - dirX * trailLength;
       const tailY = bullet.y - dirY * trailLength;
 
-      ctx.strokeStyle = "rgba(102, 246, 255, 0.16)";
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.16)";
       ctx.lineWidth = bullet.size * 3.6;
       ctx.lineCap = "round";
       ctx.beginPath();
@@ -4655,12 +5460,12 @@ function drawBullets() {
       ctx.lineTo(bullet.x, bullet.y);
       ctx.stroke();
 
-      ctx.fillStyle = "rgba(102, 246, 255, 0.28)";
+      ctx.fillStyle = "rgba(255, 255, 255, 0.28)";
       ctx.beginPath();
       ctx.arc(bullet.x, bullet.y, bullet.size * 1.05, 0, TAU);
       ctx.fill();
 
-      ctx.fillStyle = "#d6ffff";
+      ctx.fillStyle = "#ffffff";
       ctx.beginPath();
       ctx.arc(bullet.x, bullet.y, bullet.size * 0.5, 0, TAU);
       ctx.fill();
@@ -4714,6 +5519,21 @@ function getMobileRageButtonRect() {
     y: 30,
     width: 58,
     height: 18
+  };
+}
+
+function getInGameSettingsButtonRect() {
+  const progressX = 8;
+  const progressWidth = WORLD_WIDTH - 16;
+  const milestone60 = progressX + progressWidth;
+  const width = 14;
+  const height = 14;
+
+  return {
+    x: Math.round(milestone60 - width - 2),
+    y: 20,
+    width,
+    height
   };
 }
 
@@ -4941,6 +5761,33 @@ function drawHud() {
     ctx.font = "bold 7px monospace";
     ctx.fillText("TOUCH ITEMS OR PRESS READY", WORLD_WIDTH - 151, 67);
   }
+
+  const settingsRect = getInGameSettingsButtonRect();
+  ctx.fillStyle = "rgba(14, 16, 24, 0.82)";
+  ctx.fillRect(settingsRect.x, settingsRect.y, settingsRect.width, settingsRect.height);
+  ctx.strokeStyle = "rgba(255, 240, 204, 0.45)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(settingsRect.x + 0.5, settingsRect.y + 0.5, settingsRect.width - 1, settingsRect.height - 1);
+
+  const centerX = settingsRect.x + settingsRect.width / 2;
+  const centerY = settingsRect.y + settingsRect.height / 2;
+  ctx.strokeStyle = "#fff1da";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, 3, 0, TAU);
+  ctx.stroke();
+
+  for (let index = 0; index < 8; index += 1) {
+    const angle = (index / 8) * TAU;
+    const innerX = centerX + Math.cos(angle) * 4;
+    const innerY = centerY + Math.sin(angle) * 4;
+    const outerX = centerX + Math.cos(angle) * 5.5;
+    const outerY = centerY + Math.sin(angle) * 5.5;
+    ctx.beginPath();
+    ctx.moveTo(innerX, innerY);
+    ctx.lineTo(outerX, outerY);
+    ctx.stroke();
+  }
 }
 
 function drawPauseOverlay() {
@@ -5034,6 +5881,10 @@ function clearShareArtifacts() {
 }
 
 function openMenu(screen: MenuScreen = "home") {
+  if (!gameStarted && menuScreen === "death" && screen !== "death") {
+    return;
+  }
+
   menuOpen = true;
   if (gameStarted) {
     isPaused = true;
@@ -5047,6 +5898,10 @@ function openMenu(screen: MenuScreen = "home") {
 }
 
 function closeMenu() {
+  if (!gameStarted && menuScreen === "death") {
+    return;
+  }
+
   menuOpen = false;
   if (scannerMode) {
     void stopScanner(false);
@@ -5058,6 +5913,10 @@ function closeMenu() {
 }
 
 function toggleGameMenu() {
+  if (menuScreen === "death") {
+    return;
+  }
+
   if (!gameStarted) {
     openMenu("home");
     return;
@@ -5080,6 +5939,8 @@ function resetToMenuHome() {
 
 function startSoloGame() {
   disconnectMultiplayer(false);
+  resetMovementInputState();
+  input.shoot = false;
   gameStarted = true;
   isPaused = false;
   hostSimulationAccumulator = 0;
@@ -5835,13 +6696,87 @@ menuOverlay.addEventListener("click", (event) => {
   }
 
   const action = button.dataset.action;
+  if (action === "buy-damage") {
+    ensureAudio();
+    audioContext?.resume();
+    tryBuyDeathShopUpgrade("damage");
+    return;
+  }
+
+  if (action === "buy-max-hp") {
+    ensureAudio();
+    audioContext?.resume();
+    tryBuyDeathShopUpgrade("maxHp");
+    return;
+  }
+
+  if (action === "buy-helper") {
+    ensureAudio();
+    audioContext?.resume();
+    tryBuyDeathShopUpgrade("helper");
+    return;
+  }
+
+  if (action === "buy-double-bullets-item") {
+    ensureAudio();
+    audioContext?.resume();
+    tryBuyDeathShopItem("doubleBullets", 20);
+    return;
+  }
+
+  if (action === "buy-speed-item") {
+    ensureAudio();
+    audioContext?.resume();
+    tryBuyDeathShopItem("speedBoost", 10);
+    return;
+  }
+
+  if (action === "buy-auto-aim-item") {
+    ensureAudio();
+    audioContext?.resume();
+    tryBuyDeathShopItem("autoAim", 20);
+    return;
+  }
+
+  if (action === "toggle-double-bullets-item") {
+    ensureAudio();
+    audioContext?.resume();
+    toggleDeathShopItem("doubleBullets");
+    return;
+  }
+
+  if (action === "toggle-speed-item") {
+    ensureAudio();
+    audioContext?.resume();
+    toggleDeathShopItem("speedBoost");
+    return;
+  }
+
+  if (action === "toggle-auto-aim-item") {
+    ensureAudio();
+    audioContext?.resume();
+    toggleDeathShopItem("autoAim");
+    return;
+  }
+
+  if (action === "restart-run") {
+    startSoloGame();
+    return;
+  }
+
   if (action === "new-game") {
+    resetProgressionState();
     startSoloGame();
     return;
   }
 
   if (action === "resume-game") {
     closeMenu();
+    return;
+  }
+
+  if (action === "show-settings") {
+    setMenuScreen("settings");
     return;
   }
 
@@ -5852,6 +6787,41 @@ menuOverlay.addEventListener("click", (event) => {
 
   if (action === "show-rules") {
     setMenuScreen("rules");
+    return;
+  }
+
+  if (action === "toggle-shoot-sfx") {
+    toggleAudioSetting("shoot");
+    return;
+  }
+
+  if (action === "toggle-lightning-sfx") {
+    toggleAudioSetting("lightning");
+    return;
+  }
+
+  if (action === "toggle-meteor-sfx") {
+    toggleAudioSetting("meteor");
+    return;
+  }
+
+  if (action === "toggle-damage-taken-sfx") {
+    toggleAudioSetting("damageTaken");
+    return;
+  }
+
+  if (action === "toggle-damage-dealt-sfx") {
+    toggleAudioSetting("damageDealt");
+    return;
+  }
+
+  if (action === "toggle-damage-flash") {
+    toggleAudioSetting("damageFlash");
+    return;
+  }
+
+  if (action === "back-settings") {
+    setMenuScreen("home");
     return;
   }
 
@@ -6139,6 +7109,12 @@ function handleTouchPress(clientX: number, clientY: number) {
     return true;
   }
 
+  const settingsRect = getInGameSettingsButtonRect();
+  if (isInsideRect(point.x, point.y, settingsRect.x, settingsRect.y, settingsRect.width, settingsRect.height)) {
+    openMenu("settings");
+    return true;
+  }
+
   if (shopPhaseActive) {
     const readyRect = getShopReadyButtonRect();
     if (
@@ -6219,6 +7195,15 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (event.code === "KeyH") {
+    const player = getControlledPlayer();
+    if (player && !isPaused) {
+      downPlayer(player);
+    }
+    event.preventDefault();
+    return;
+  }
+
   if (event.code === "KeyP" || event.code === "Escape") {
     toggleGameMenu();
     event.preventDefault();
@@ -6294,6 +7279,14 @@ canvas.addEventListener("mousedown", (event) => {
   updateMousePosition(event);
 
   if (isPaused) {
+    return;
+  }
+
+  const settingsRect = getInGameSettingsButtonRect();
+  if (
+    isInsideRect(input.mouseX, input.mouseY, settingsRect.x, settingsRect.y, settingsRect.width, settingsRect.height)
+  ) {
+    openMenu("settings");
     return;
   }
 
